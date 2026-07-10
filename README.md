@@ -26,6 +26,13 @@ that was actually retrieved.
 
 Python, FastAPI, SQLite, MLB-StatsAPI, the Anthropic API, and React + Tailwind.
 
+## Data
+
+MLB data comes from the official MLB Stats API, accessed through
+[toddrob99's `MLB-StatsAPI`](https://github.com/toddrob99/MLB-StatsAPI) Python
+wrapper. The wrapper is isolated to `sports/mlb/client.py`, so the data source
+can be swapped without touching the rest of the pipeline.
+
 ## Setup
 
 ```bash
