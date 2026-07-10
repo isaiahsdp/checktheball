@@ -41,3 +41,30 @@ def get_player_career_stats(
 def find_players(name: str) -> list[dict[str, Any]]:
     """Look up players by (partial) name; used to resolve names to IDs."""
     return statsapi.lookup_player(name)
+
+
+def get_league_leaders(
+    category: str,
+    season: int | None = None,
+    limit: int = 10,
+    group: str | None = None,
+) -> list[list[Any]]:
+    """Leaderboard rows [rank, name, team, value] for a stat category."""
+    return statsapi.league_leader_data(
+        category, season=season, limit=limit, statGroup=group
+    )
+
+
+def get_player_splits(
+    player_id: int | str,
+    sit_codes: list[str],
+    season: int | None = None,
+    group: str = "hitting",
+) -> dict[str, Any]:
+    """A player's situational splits for the given sitCodes (h, a, vl, vr, ...)."""
+    codes = ",".join(sit_codes)
+    hydrate = f"stats(group=[{group}],type=[statSplits],sitCodes=[{codes}]"
+    if season is not None:
+        hydrate += f",season={season}"
+    hydrate += ")"
+    return statsapi.get("person", {"personId": player_id, "hydrate": hydrate})

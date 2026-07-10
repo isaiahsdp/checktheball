@@ -118,3 +118,63 @@ def normalize_player_stat(
         season=season,
         stats=chosen.get("stats", {}),
     )
+
+
+def to_number(value: Any) -> Any:
+    """Coerce a stat value to int/float when possible; leave it unchanged if not.
+
+    The API returns some stats as strings ("58", ".322"); numeric comparison
+    and projection need real numbers, but non-numeric values (e.g. "-.--")
+    pass through untouched.
+    """
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return float(text)
+            except ValueError:
+                return value
+    return value
+
+
+def normalize_leaders(rows: list[list[Any]]) -> list[dict[str, Any]]:
+    """Leaderboard rows [rank, name, team, value] -> list of dicts."""
+    leaders = []
+    for row in rows:
+        if len(row) < 4:
+            continue
+        leaders.append(
+            {
+                "rank": to_number(row[0]),
+                "player": row[1],
+                "team": row[2],
+                "value": to_number(row[3]),
+            }
+        )
+    return leaders
+
+
+def normalize_splits(
+    raw: dict[str, Any], group: str | None = None
+) -> list[dict[str, Any]]:
+    """Split-hydrated person payload -> list of {code, description, stats}."""
+    people = raw.get("people", [])
+    if not people:
+        return []
+
+    splits = []
+    for stat_group in people[0].get("stats", []):
+        for entry in stat_group.get("splits", []):
+            meta = entry.get("split", {})
+            splits.append(
+                {
+                    "code": meta.get("code"),
+                    "description": meta.get("description"),
+                    "stats": entry.get("stat", {}),
+                }
+            )
+    return splits
