@@ -1,12 +1,14 @@
-"""Verify the MLB data layer end to end.
+"""Verify the MLB data layer and tools end to end.
 
-Two kinds of checks:
+Kinds of checks:
 
 * Offline: feed hand-built payloads through the normalizer to confirm the
   defensive guards (missing fields, empty values) behave. No network.
 * Live: drive client -> normalizer -> schema against the real MLB Stats API,
   and exercise the SQLite cache. Anchored on historical facts (a 2024 game,
   Aaron Judge's 2024 season) that don't change, so results stay stable.
+* Tools: call each Claude-facing tool and check its output against known 2024
+  numbers, plus the error paths and schema shape.
 
 Run from the repo root:
 
@@ -26,7 +28,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import db, schema
-from sports.mlb import client, normalizer
+from sports.mlb import client, normalizer, tools
 
 _passed = 0
 _failed = 0
@@ -146,10 +148,46 @@ def cache_checks() -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def tool_checks() -> None:
+    print("Tool checks (Claude-facing tools vs known 2024 numbers)")
+
+    stat = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024)
+    check("get_player_stat: Judge 2024 HR == 58", stat.get("value") == 58)
+
+    comp = tools.compare_players("Aaron Judge", "Shohei Ohtani", "homeRuns", season=2024)
+    check("compare_players: Judge leads by 4", comp.get("leader") == "Aaron Judge" and comp.get("difference") == 4)
+
+    top = tools.get_top_performers("homeRuns", season=2024, limit=5)
+    check("get_top_performers: Judge is #1 with 58", top["leaders"][0]["value"] == 58)
+
+    pace = tools.compute_pace_projection("Aaron Judge", "homeRuns", season=2024)
+    check("compute_pace_projection: 58 in 158 G -> 59.5", pace.get("projected_value") == round(58 / 158 * 162, 1))
+
+    split = tools.get_situational_split("Aaron Judge", "home", season=2024)
+    check("get_situational_split: Judge home HR == 31", split["stats"].get("homeRuns") == 31)
+
+    # Error paths return an {"error": ...} dict rather than raising.
+    check("unknown player -> error", "error" in tools.get_player_stat("Zzz Notreal", "homeRuns", season=2024))
+    bad_stat = tools.get_player_stat("Aaron Judge", "notAStat", season=2024)
+    check("unavailable stat -> error + hint", "error" in bad_stat and "available_stats" in bad_stat)
+    check("unknown split -> error", "error" in tools.get_situational_split("Aaron Judge", "in_the_rain", season=2024))
+    check("call_tool dispatches unknown -> error", tools.call_tool("nope", {}).get("error", "").startswith("Unknown tool"))
+
+    # Every advertised schema has a matching function and the required shape.
+    names_match = {s["name"] for s in tools.TOOL_SCHEMAS} == set(tools.TOOL_FUNCTIONS)
+    well_formed = all(
+        {"name", "description", "input_schema"} <= set(s)
+        and s["input_schema"]["type"] == "object"
+        for s in tools.TOOL_SCHEMAS
+    )
+    check("tool schemas match functions and are well-formed", names_match and well_formed)
+
+
 def main() -> int:
     offline_checks()
     live_checks()
     cache_checks()
+    tool_checks()
     print(f"\n{_passed} passed, {_failed} failed")
     return 1 if _failed else 0
 
