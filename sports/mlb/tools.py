@@ -212,7 +212,7 @@ TOOL_FUNCTIONS = {
 
 
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Dispatch a tool call by name. Used by the orchestrator in Stage 3."""
+    """Dispatch a tool call by name. Used by the orchestrator."""
     func = TOOL_FUNCTIONS.get(name)
     if func is None:
         return {"error": f"Unknown tool: {name}"}
