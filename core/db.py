@@ -43,7 +43,7 @@ def _now() -> str:
 
 
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
-    """Create the cache tables if they don't exist."""
+    """Create the cache tables and the query log if they don't exist."""
     with closing(_connect(db_path)) as conn:
         for table in _TABLES:
             conn.execute(
@@ -56,6 +56,37 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 )
                 """
             )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS queries (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at      TEXT NOT NULL,
+                question        TEXT NOT NULL,
+                answer          TEXT NOT NULL,
+                tool_calls      TEXT NOT NULL,
+                grounding_score REAL
+            )
+            """
+        )
+        conn.commit()
+
+
+def log_query(
+    question: str,
+    answer: str,
+    tool_calls: Any,
+    grounding_score: float | None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    """Record one answered question and its grounding score."""
+    with closing(_connect(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO queries (created_at, question, answer, tool_calls, grounding_score)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (_now(), question, answer, json.dumps(tool_calls, default=_json_default), grounding_score),
+        )
         conn.commit()
 
 
