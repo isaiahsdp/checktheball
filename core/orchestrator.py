@@ -44,6 +44,14 @@ your conclusion.
 - Be concise and factual. Any number you state must match a tool result exactly.
 """
 
+# The system prompt and tool schemas are identical on every request, so we mark
+# them cacheable. The breakpoint sits on the system block, which caches the tool
+# schemas ahead of it too; each extra loop round and each later question reuses
+# the prefix instead of reprocessing it.
+_SYSTEM_BLOCKS = [
+    {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
+]
+
 
 class ToolProvider(Protocol):
     """Structural contract a sport module must satisfy to drive the loop."""
@@ -89,7 +97,7 @@ def answer_question(
         request: dict[str, Any] = {
             "model": model,
             "max_tokens": MAX_TOKENS,
-            "system": SYSTEM_PROMPT,
+            "system": _SYSTEM_BLOCKS,
             "tools": tools.TOOL_SCHEMAS,
             "messages": messages,
         }
