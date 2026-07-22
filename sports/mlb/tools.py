@@ -244,6 +244,22 @@ def _cached_boxscore(game_id: int | str) -> dict[str, Any]:
     )
 
 
+def _todays_hitting_lines(date: str | None) -> list[dict[str, Any]]:
+    """Every hitter's line for the day in one cached call, newest-first by fetch.
+
+    Backs the "today" questions with a single league-wide request instead of one
+    box score per game.
+    """
+    day = date or datetime.now().strftime("%Y-%m-%d")
+    return db.cached_fetch(
+        "player_stats_cache",
+        f"day_hitting:{day}",
+        SPORT,
+        lambda: normalizer.normalize_date_range_hitters(client.get_stats_by_date(day)),
+        _BOXSCORE_MAX_AGE_SECONDS,
+    )
+
+
 def _rank_value(stats: dict[str, Any], stat: str) -> float:
     if stat == "fantasy":
         return fantasy.hitter_points(stats)
@@ -274,14 +290,9 @@ def get_todays_top_performers(
             "available_stats": list(_RANKABLE_STATS),
         }
 
-    games = [g for g in _cached_schedule(date) if g.get("status") in _STARTED_STATUSES]
-    if not games:
+    batters = _todays_hitting_lines(date)
+    if not batters:
         return {"error": "No games have started yet for that date."}
-
-    batters: list[dict[str, Any]] = []
-    for game in games:
-        box = _cached_boxscore(game["game_id"])
-        batters.extend(normalizer.normalize_boxscore_batters(box))
 
     batters.sort(key=lambda b: _rank_value(b["stats"], stat), reverse=True)
     leaders = [
@@ -294,7 +305,7 @@ def get_todays_top_performers(
         }
         for b in batters[: max(1, limit)]
     ]
-    result = {"date": date or "today", "stat": stat, "games_counted": len(games), "leaders": leaders}
+    result = {"date": date or "today", "stat": stat, "hitters_counted": len(batters), "leaders": leaders}
     if stat == "fantasy":
         result["scoring"] = fantasy.SCORING_SYSTEM
     return result
@@ -329,20 +340,17 @@ def get_fantasy_points(
         }
 
     # No season given: score the player's line in today's game.
-    for game in _cached_schedule(date):
-        if game.get("status") not in _STARTED_STATUSES:
-            continue
-        for batter in normalizer.normalize_boxscore_batters(_cached_boxscore(game["game_id"])):
-            if _name_matches(player, batter["player"]):
-                return {
-                    "player": batter["player"],
-                    "team": batter["team"],
-                    "scope": "game",
-                    "date": date or "today",
-                    "fantasy_points": fantasy.hitter_points(batter["stats"]),
-                    "scoring": fantasy.SCORING_SYSTEM,
-                    "line": batter["stats"],
-                }
+    for batter in _todays_hitting_lines(date):
+        if _name_matches(player, batter["player"]):
+            return {
+                "player": batter["player"],
+                "team": batter["team"],
+                "scope": "game",
+                "date": date or "today",
+                "fantasy_points": fantasy.hitter_points(batter["stats"]),
+                "scoring": fantasy.SCORING_SYSTEM,
+                "line": batter["stats"],
+            }
     return {"error": f"No player matching '{player}' found in today's games. Specify a season for season totals."}
 
 

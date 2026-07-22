@@ -27,6 +27,25 @@ def get_game_boxscore(game_id: int | str) -> dict[str, Any]:
     return statsapi.boxscore_data(game_id)
 
 
+def get_stats_by_date(
+    date: str, group: str = "hitting", limit: int = 500, sort_stat: str = "homeRuns"
+) -> dict[str, Any]:
+    """Every player's stat line for a single date, league-wide, in one request."""
+    return statsapi.get(
+        "stats",
+        {
+            "stats": "byDateRange",
+            "group": group,
+            "sportId": 1,
+            "gameType": "R",
+            "startDate": date,
+            "endDate": date,
+            "limit": limit,
+            "sortStat": sort_stat,
+        },
+    )
+
+
 def get_player_season_stats(
     player_id: int | str, season: int | None = None, group: str = "hitting"
 ) -> dict[str, Any]:

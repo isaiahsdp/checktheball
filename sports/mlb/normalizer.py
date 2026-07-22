@@ -124,6 +124,37 @@ def normalize_player_stat(
 # avg/ops in a box score are season rates, not the game, so they are left out.
 _BOX_HITTING_STATS = ("ab", "r", "h", "doubles", "triples", "hr", "rbi", "sb", "bb", "k")
 
+# Our batting-line keys mapped to the MLB byDateRange stat names.
+_DATE_RANGE_HITTING = {
+    "ab": "atBats",
+    "r": "runs",
+    "h": "hits",
+    "doubles": "doubles",
+    "triples": "triples",
+    "hr": "homeRuns",
+    "rbi": "rbi",
+    "sb": "stolenBases",
+    "bb": "baseOnBalls",
+    "k": "strikeOuts",
+}
+
+
+def normalize_date_range_hitters(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """byDateRange payload -> one batting line per player, same shape as a box line."""
+    groups = raw.get("stats", [])
+    splits = groups[0].get("splits", []) if groups else []
+    lines: list[dict[str, Any]] = []
+    for split in splits:
+        stat = split.get("stat", {})
+        lines.append(
+            {
+                "player": split.get("player", {}).get("fullName"),
+                "team": split.get("team", {}).get("name"),
+                "stats": {k: to_number(stat.get(src, 0)) for k, src in _DATE_RANGE_HITTING.items()},
+            }
+        )
+    return lines
+
 
 def normalize_boxscore_batters(raw: dict[str, Any]) -> list[dict[str, Any]]:
     """Box-score payload -> one batting line per player across both teams.
