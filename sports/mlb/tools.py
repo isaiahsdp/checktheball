@@ -15,10 +15,35 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sports.mlb import client, normalizer
+from core import db
+from sports.mlb import client, fantasy, normalizer
 
 SPORT = "mlb"
 FULL_MLB_SEASON_GAMES = 162
+
+# Live box scores and the schedule move during the day, so cache them briefly.
+_BOXSCORE_MAX_AGE_SECONDS = 60
+_SCHEDULE_MAX_AGE_SECONDS = 60
+
+# Schedule statuses whose games have a readable box score.
+_STARTED_STATUSES = {"In Progress", "Manager challenge", "Final", "Game Over", "Completed Early"}
+
+# Today's-game counting stats that make sense to rank live performers by, plus
+# "fantasy" for a computed fantasy-point ranking.
+_GAME_HITTING_STATS = ("ab", "r", "h", "doubles", "triples", "hr", "rbi", "sb", "bb", "k")
+_RANKABLE_STATS = _GAME_HITTING_STATS + ("fantasy",)
+
+# Season stat keys (MLB naming) mapped to the keys the fantasy formula expects.
+_SEASON_TO_FANTASY = {
+    "h": "hits",
+    "doubles": "doubles",
+    "triples": "triples",
+    "hr": "homeRuns",
+    "rbi": "rbi",
+    "r": "runs",
+    "bb": "baseOnBalls",
+    "sb": "stolenBases",
+}
 
 # Friendly split name -> MLB sitCode.
 _SPLIT_CODES = {
@@ -202,12 +227,169 @@ def get_situational_split(
     }
 
 
+def _cached_schedule(date: str | None) -> list[dict[str, Any]]:
+    key = f"raw_schedule:{date or 'today'}"
+    return db.cached_fetch(
+        "games", key, SPORT, lambda: client.get_schedule(date=date), _SCHEDULE_MAX_AGE_SECONDS
+    )
+
+
+def _cached_boxscore(game_id: int | str) -> dict[str, Any]:
+    return db.cached_fetch(
+        "player_stats_cache",
+        f"boxscore:{game_id}",
+        SPORT,
+        lambda: client.get_game_boxscore(game_id),
+        _BOXSCORE_MAX_AGE_SECONDS,
+    )
+
+
+def _rank_value(stats: dict[str, Any], stat: str) -> float:
+    if stat == "fantasy":
+        return fantasy.hitter_points(stats)
+    value = stats.get(stat)
+    return value if isinstance(value, (int, float)) else 0
+
+
+def _name_matches(query: str, full_name: str) -> bool:
+    q, full = query.lower().strip(), (full_name or "").lower()
+    return bool(q) and (q in full or all(word in full for word in q.split()))
+
+
+def _team_matches(query: str, full_name: str) -> bool:
+    q, full = query.lower().strip(), full_name.lower()
+    return q in full or any(word in full for word in q.split())
+
+
+def get_todays_top_performers(
+    stat: str = "h", limit: int = 5, date: str | None = None
+) -> dict[str, Any]:
+    """Rank the top batters across today's games by a single-game counting stat.
+
+    ``stat="fantasy"`` ranks by computed DraftKings fantasy points.
+    """
+    if stat not in _RANKABLE_STATS:
+        return {
+            "error": f"Can't rank live games by '{stat}'.",
+            "available_stats": list(_RANKABLE_STATS),
+        }
+
+    games = [g for g in _cached_schedule(date) if g.get("status") in _STARTED_STATUSES]
+    if not games:
+        return {"error": "No games have started yet for that date."}
+
+    batters: list[dict[str, Any]] = []
+    for game in games:
+        box = _cached_boxscore(game["game_id"])
+        batters.extend(normalizer.normalize_boxscore_batters(box))
+
+    batters.sort(key=lambda b: _rank_value(b["stats"], stat), reverse=True)
+    leaders = [
+        {
+            "player": b["player"],
+            "team": b["team"],
+            "value": _rank_value(b["stats"], stat),
+            "fantasy_points": fantasy.hitter_points(b["stats"]),
+            "line": b["stats"],
+        }
+        for b in batters[: max(1, limit)]
+    ]
+    result = {"date": date or "today", "stat": stat, "games_counted": len(games), "leaders": leaders}
+    if stat == "fantasy":
+        result["scoring"] = fantasy.SCORING_SYSTEM
+    return result
+
+
+def get_fantasy_points(
+    player: str, season: int | None = None, date: str | None = None
+) -> dict[str, Any]:
+    """Compute a hitter's fantasy points for today's game, or a full season.
+
+    With ``season`` set, scores the season totals; otherwise scores the player's
+    line in today's game. Uses DraftKings classic hitter scoring.
+    """
+    if season is not None:
+        resolved = _resolve_player(player)
+        if resolved is None:
+            return {"error": f"No player found matching '{player}'."}
+        player_id, full_name = resolved
+        raw = client.get_player_season_stats(player_id, season=season, group="hitting")
+        line = normalizer.normalize_player_stat(raw, group="hitting")
+        stats = {
+            key: normalizer.to_number(line.stats.get(src, 0))
+            for key, src in _SEASON_TO_FANTASY.items()
+        }
+        return {
+            "player": line.player_name or full_name,
+            "scope": "season",
+            "season": line.season,
+            "fantasy_points": fantasy.hitter_points(stats),
+            "scoring": fantasy.SCORING_SYSTEM,
+            "line": stats,
+        }
+
+    # No season given: score the player's line in today's game.
+    for game in _cached_schedule(date):
+        if game.get("status") not in _STARTED_STATUSES:
+            continue
+        for batter in normalizer.normalize_boxscore_batters(_cached_boxscore(game["game_id"])):
+            if _name_matches(player, batter["player"]):
+                return {
+                    "player": batter["player"],
+                    "team": batter["team"],
+                    "scope": "game",
+                    "date": date or "today",
+                    "fantasy_points": fantasy.hitter_points(batter["stats"]),
+                    "scoring": fantasy.SCORING_SYSTEM,
+                    "line": batter["stats"],
+                }
+    return {"error": f"No player matching '{player}' found in today's games. Specify a season for season totals."}
+
+
+def get_game_boxscore(team_a: str, team_b: str, date: str | None = None) -> dict[str, Any]:
+    """Batting lines for a single game today, identified by its two teams."""
+    game = next(
+        (
+            g
+            for g in _cached_schedule(date)
+            if (_team_matches(team_a, g.get("away_name", "")) and _team_matches(team_b, g.get("home_name", "")))
+            or (_team_matches(team_a, g.get("home_name", "")) and _team_matches(team_b, g.get("away_name", "")))
+        ),
+        None,
+    )
+    if game is None:
+        return {"error": f"No game found between '{team_a}' and '{team_b}' for that date."}
+    if game.get("status") not in _STARTED_STATUSES:
+        return {
+            "error": f"The {game.get('away_name')} at {game.get('home_name')} game hasn't started yet.",
+            "status": game.get("status"),
+        }
+
+    batters = normalizer.normalize_boxscore_batters(_cached_boxscore(game["game_id"]))
+    for batter in batters:
+        batter["fantasy_points"] = fantasy.hitter_points(batter["stats"])
+    batters.sort(key=lambda b: b["fantasy_points"], reverse=True)
+    return {
+        "date": date or "today",
+        "away_team": game.get("away_name"),
+        "home_team": game.get("home_name"),
+        "status": game.get("status"),
+        "away_score": game.get("away_score"),
+        "home_score": game.get("home_score"),
+        "scoring": fantasy.SCORING_SYSTEM,
+        "batters": batters,
+    }
+
+
 TOOL_FUNCTIONS = {
     "get_player_stat": get_player_stat,
     "compare_players": compare_players,
     "get_top_performers": get_top_performers,
     "compute_pace_projection": compute_pace_projection,
     "get_situational_split": get_situational_split,
+    "get_todays_top_performers": get_todays_top_performers,
+    "get_game_boxscore": get_game_boxscore,
+    "get_fantasy_points": get_fantasy_points,
 }
 
 
@@ -332,6 +514,64 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 },
             },
             "required": ["player", "split"],
+        },
+    },
+    {
+        "name": "get_todays_top_performers",
+        "description": (
+            "Rank the best batters across today's live and finished games by a "
+            "single-game counting stat, or by 'fantasy' for DraftKings fantasy "
+            "points. Use for 'who is the best/top performer today', 'who has the "
+            "most hits today', 'who has the most fantasy points today'. Reflects "
+            "today's games only, not season totals."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stat": {
+                    "type": "string",
+                    "enum": list(_RANKABLE_STATS),
+                    "description": "Stat to rank by. 'fantasy' ranks by fantasy points. Defaults to 'h' (hits).",
+                },
+                "limit": {"type": "integer", "description": "How many players to return. Defaults to 5."},
+                "date": {"type": "string", "description": "YYYY-MM-DD. Defaults to today."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_fantasy_points",
+        "description": (
+            "Compute a hitter's DraftKings fantasy points, either for today's "
+            "game (default) or for a full season (pass 'season'). Use for 'how "
+            "many fantasy points does X have today' or 'X's fantasy points in "
+            "2024'. Hitters only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "player": {"type": "string", "description": "Player full name, e.g. 'Aaron Judge'."},
+                "season": {"type": "integer", "description": "Four-digit year for season totals. Omit for today's game."},
+                "date": {"type": "string", "description": "YYYY-MM-DD for the game. Defaults to today."},
+            },
+            "required": ["player"],
+        },
+    },
+    {
+        "name": "get_game_boxscore",
+        "description": (
+            "Get the per-batter lines for one specific game today, identified by "
+            "its two teams. Use for 'who is performing in the Giants vs Royals "
+            "game' or 'how is X doing in today's game'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "team_a": {"type": "string", "description": "One team's name, e.g. 'Giants' or 'San Francisco'."},
+                "team_b": {"type": "string", "description": "The other team's name."},
+                "date": {"type": "string", "description": "YYYY-MM-DD. Defaults to today."},
+            },
+            "required": ["team_a", "team_b"],
         },
     },
 ]

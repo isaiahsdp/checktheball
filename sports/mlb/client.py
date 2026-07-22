@@ -22,6 +22,11 @@ def get_game_playbyplay(game_id: int | str) -> dict[str, Any]:
     return statsapi.get("game_playByPlay", {"gamePk": game_id})
 
 
+def get_game_boxscore(game_id: int | str) -> dict[str, Any]:
+    """Box score payload (per-player batting and pitching lines) for one game."""
+    return statsapi.boxscore_data(game_id)
+
+
 def get_player_season_stats(
     player_id: int | str, season: int | None = None, group: str = "hitting"
 ) -> dict[str, Any]:

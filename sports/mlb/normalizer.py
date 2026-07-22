@@ -120,6 +120,40 @@ def normalize_player_stat(
     )
 
 
+# Box-score batting fields that describe today's game (counting stats). The
+# avg/ops in a box score are season rates, not the game, so they are left out.
+_BOX_HITTING_STATS = ("ab", "r", "h", "doubles", "triples", "hr", "rbi", "sb", "bb", "k")
+
+
+def normalize_boxscore_batters(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Box-score payload -> one batting line per player across both teams.
+
+    Header and total rows (personId 0) are dropped; stats are this game's
+    counting totals coerced to numbers.
+    """
+    team_info = raw.get("teamInfo", {})
+    player_info = raw.get("playerInfo", {})
+    lines: list[dict[str, Any]] = []
+    for side in ("away", "home"):
+        info = team_info.get(side, {})
+        team = f"{info.get('shortName', '')} {info.get('teamName', '')}".strip()
+        for batter in raw.get(f"{side}Batters", []):
+            person_id = batter.get("personId")
+            if not person_id:  # skip header / total rows
+                continue
+            # Prefer the full name so answers don't guess ("Machado, M" -> full).
+            full_name = player_info.get(f"ID{person_id}", {}).get("fullName")
+            lines.append(
+                {
+                    "player": full_name or batter.get("name"),
+                    "team": team,
+                    "position": batter.get("position"),
+                    "stats": {k: to_number(batter.get(k)) for k in _BOX_HITTING_STATS},
+                }
+            )
+    return lines
+
+
 def to_number(value: Any) -> Any:
     """Coerce a stat value to int/float when possible; leave it unchanged if not.
 
