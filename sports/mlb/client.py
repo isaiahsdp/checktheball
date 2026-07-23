@@ -92,3 +92,53 @@ def get_player_splits(
         hydrate += f",season={season}"
     hydrate += ")"
     return statsapi.get("person", {"personId": player_id, "hydrate": hydrate})
+
+
+def get_player_stats_by_date_range(
+    player_id: int | str,
+    start_date: str,
+    end_date: str,
+    group: str = "hitting",
+    season: int | None = None,
+) -> dict[str, Any]:
+    """A player's stats aggregated over a date range (MLB-computed, not by us)."""
+    hydrate = (
+        f"stats(group=[{group}],type=[byDateRange],"
+        f"startDate={start_date},endDate={end_date}"
+    )
+    if season is not None:
+        hydrate += f",season={season}"
+    hydrate += ")"
+    return statsapi.get("person", {"personId": player_id, "hydrate": hydrate})
+
+
+def get_player_last_x_games(
+    player_id: int | str, count: int, group: str = "hitting", season: int | None = None
+) -> dict[str, Any]:
+    """A player's stats over their last ``count`` games (MLB-computed)."""
+    hydrate = f"stats(group=[{group}],type=[lastXGames],limit={count}"
+    if season is not None:
+        hydrate += f",season={season}"
+    hydrate += ")"
+    return statsapi.get("person", {"personId": player_id, "hydrate": hydrate})
+
+
+def get_player_vs_team(
+    player_id: int | str, opponent_team_id: int | str, season: int | None = None, group: str = "hitting"
+) -> dict[str, Any]:
+    """A player's stats against one opponent team (MLB-computed head-to-head)."""
+    hydrate = f"stats(group=[{group}],type=[vsTeam],opposingTeamId={opponent_team_id}"
+    if season is not None:
+        hydrate += f",season={season}"
+    hydrate += ")"
+    return statsapi.get("person", {"personId": player_id, "hydrate": hydrate})
+
+
+def get_season_info(season: int) -> dict[str, Any]:
+    """Season metadata, including the All-Star break dates."""
+    return statsapi.get("season", {"seasonId": season, "sportId": 1})
+
+
+def find_teams(name: str) -> list[dict[str, Any]]:
+    """Look up teams by (partial) name; used to resolve an opponent to an id."""
+    return statsapi.lookup_team(name)

@@ -28,7 +28,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import db, schema
-from sports.mlb import client, normalizer, tools
+from sports.mlb import client, fantasy, normalizer, tools
 
 _passed = 0
 _failed = 0
@@ -81,6 +81,48 @@ def offline_checks() -> None:
     )
     check("empty stats -> empty dict", ps.stats == {})
     check("player name assembled", ps.player_name == "Test Player")
+
+    # Fantasy scoring: pure formula on a known line.
+    line = {"h": 2, "doubles": 1, "triples": 0, "hr": 1, "rbi": 2, "r": 1, "bb": 1, "sb": 1}
+    # 0 singles*3 + 1 double*5 + 1 hr*10 + 2 rbi*2 + 1 run*2 + 1 bb*2 + 1 sb*5 = 28
+    check("fantasy points on known line == 28", fantasy.hitter_points(line) == 28)
+    judge = {"h": 180, "doubles": 36, "triples": 1, "hr": 58, "rbi": 144, "r": 122, "bb": 133, "sb": 10}
+    check("fantasy points on Judge 2024 line == 1871", fantasy.hitter_points(judge) == 1871)
+    check("fantasy points on empty line == 0", fantasy.hitter_points({}) == 0)
+
+    # Box-score normalizer: skip header rows, use full names, drop season rates.
+    box = {
+        "teamInfo": {
+            "away": {"shortName": "Minnesota", "teamName": "Twins"},
+            "home": {"shortName": "Cleveland", "teamName": "Guardians"},
+        },
+        "playerInfo": {"ID123": {"fullName": "Full Name"}},
+        "awayBatters": [
+            {"personId": 0, "name": "Twins Batters", "ab": "AB"},  # header row
+            {"personId": 123, "name": "Name", "ab": "4", "h": "2", "doubles": "1",
+             "triples": "0", "hr": "1", "rbi": "3", "r": "1", "bb": "1", "sb": "0",
+             "k": "2", "avg": ".300", "ops": ".900"},
+        ],
+        "homeBatters": [],
+    }
+    batters = normalizer.normalize_boxscore_batters(box)
+    check("box normalizer: header row skipped", len(batters) == 1)
+    check("box normalizer: full name from playerInfo", batters[0]["player"] == "Full Name")
+    check("box normalizer: team assembled", batters[0]["team"] == "Minnesota Twins")
+    check("box normalizer: stats coerced to numbers", batters[0]["stats"]["hr"] == 1 and batters[0]["stats"]["h"] == 2)
+    check("box normalizer: season rates excluded", "avg" not in batters[0]["stats"] and "ops" not in batters[0]["stats"])
+
+    # Date-range normalizer: maps MLB stat names to our keys.
+    date_range = {"stats": [{"splits": [
+        {"player": {"fullName": "CJ Abrams"}, "team": {"name": "Washington Nationals"},
+         "stat": {"atBats": 3, "runs": 2, "hits": 2, "doubles": 0, "triples": 0,
+                  "homeRuns": 2, "rbi": 4, "stolenBases": 0, "baseOnBalls": 1, "strikeOuts": 0}},
+    ]}]}
+    hitters = normalizer.normalize_date_range_hitters(date_range)
+    check("date-range normalizer: one hitter", len(hitters) == 1)
+    check("date-range normalizer: name and team", hitters[0]["player"] == "CJ Abrams" and hitters[0]["team"] == "Washington Nationals")
+    check("date-range normalizer: keys mapped (atBats->ab, homeRuns->hr)", hitters[0]["stats"]["ab"] == 3 and hitters[0]["stats"]["hr"] == 2 and hitters[0]["stats"]["bb"] == 1)
+    check("date-range normalizer: empty payload -> []", normalizer.normalize_date_range_hitters({}) == [])
 
 
 def live_checks() -> None:
@@ -163,14 +205,14 @@ def tool_checks() -> None:
     pace = tools.compute_pace_projection("Aaron Judge", "homeRuns", season=2024)
     check("compute_pace_projection: 58 in 158 G -> 59.5", pace.get("projected_value") == round(58 / 158 * 162, 1))
 
-    split = tools.get_situational_split("Aaron Judge", "home", season=2024)
-    check("get_situational_split: Judge home HR == 31", split["stats"].get("homeRuns") == 31)
+    split = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, split="home")
+    check("get_player_stat split: Judge home HR == 31", split.get("value") == 31 and split.get("split") == "home")
 
     # Error paths return an {"error": ...} dict rather than raising.
     check("unknown player -> error", "error" in tools.get_player_stat("Zzz Notreal", "homeRuns", season=2024))
     bad_stat = tools.get_player_stat("Aaron Judge", "notAStat", season=2024)
     check("unavailable stat -> error + hint", "error" in bad_stat and "available_stats" in bad_stat)
-    check("unknown split -> error", "error" in tools.get_situational_split("Aaron Judge", "in_the_rain", season=2024))
+    check("unknown split -> error", "error" in tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, split="in_the_rain"))
     check("call_tool dispatches unknown -> error", tools.call_tool("nope", {}).get("error", "").startswith("Unknown tool"))
 
     # Every advertised schema has a matching function and the required shape.
@@ -183,11 +225,81 @@ def tool_checks() -> None:
     check("tool schemas match functions and are well-formed", names_match and well_formed)
 
 
+def filter_checks() -> None:
+    print("Filter checks (date_range, opponent, split vs stable 2024 facts)")
+
+    # date_range: all three presets + a custom window, MLB-aggregated.
+    sa = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, date_range="since_allstar")
+    check("date_range since_allstar: Judge 2024 HR == 24", sa.get("value") == 24 and sa.get("scope") == "since_allstar")
+    custom = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, start_date="2024-06-01", end_date="2024-06-30")
+    check("date_range custom Jun 2024: Judge HR == 11", custom.get("value") == 11)
+    lastx = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, date_range="last_10_games")
+    check("date_range last_10_games (2024): Judge HR == 5", lastx.get("value") == 5)
+    check("date_range window meta embedded (games == 10)", lastx.get("games") == 10)
+
+    # opponent: native head-to-head, with team-name resolution.
+    vs = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, opponent="Dodgers")
+    check("opponent vs Dodgers 2024: Judge HR == 3", vs.get("value") == 3)
+    check("opponent resolves 'Dodgers' -> Los Angeles Dodgers", vs.get("opponent") == "Los Angeles Dodgers")
+
+    # split: consolidated into get_player_stat.
+    vl = tools.get_player_stat("Aaron Judge", "avg", season=2024, split="vs_left")
+    check("split vs_left 2024: Judge avg == .311", vl.get("value") == ".311")
+
+    # fantasy: season path.
+    fp = tools.get_fantasy_points("Aaron Judge", season=2024)
+    check("season fantasy 2024: Judge == 1871", fp.get("fantasy_points") == 1871 and fp.get("scope") == "season")
+
+    # merged leaderboard, season scope.
+    lb = tools.get_top_performers("homeRuns", scope="season", season=2024, limit=3)
+    check(
+        "leaderboard scope=season: Judge #1 with 58",
+        lb["leaders"][0]["player"] == "Aaron Judge" and lb["leaders"][0]["value"] == 58 and lb["scope"] == "season",
+    )
+
+    # compare over a window keeps the window scope.
+    cmp = tools.compare_players("Aaron Judge", "Shohei Ohtani", "homeRuns", season=2024, date_range="since_allstar")
+    check("compare over date_range: scope propagates", cmp.get("scope") == "since_allstar")
+
+    # Guards: filters are not combinable, and unknown values error cleanly.
+    check("combine split+opponent -> error", "error" in tools.get_player_stat("Aaron Judge", "homeRuns", split="home", opponent="Dodgers"))
+    check("unknown opponent -> error", "error" in tools.get_player_stat("Aaron Judge", "homeRuns", opponent="Nonexistent FC"))
+    check("unknown date_range -> error", "error" in tools.get_player_stat("Aaron Judge", "homeRuns", date_range="last_5_years"))
+    check("unknown scope -> error", "error" in tools.get_top_performers("homeRuns", scope="lifetime"))
+
+
+def live_feature_checks() -> None:
+    print("Live-feature checks (today's games; structural, tolerant of off-days)")
+
+    today = tools.get_top_performers("h", scope="today", limit=3)
+    if "error" in today:
+        check("today leaderboard: clean no-games message", "no games" in today["error"].lower())
+    else:
+        check("today leaderboard: scope today with leaders", today.get("scope") == "today" and len(today["leaders"]) > 0)
+        check("today leaderboard: leaders carry fantasy_points", all("fantasy_points" in leader for leader in today["leaders"]))
+
+    fantasy = tools.get_top_performers("fantasy", scope="today", limit=3)
+    if "error" not in fantasy:
+        check("today fantasy: scoring system labeled", fantasy.get("scoring") == "DraftKings classic")
+
+    started = [g for g in tools._cached_schedule(None) if g.get("status") in tools._STARTED_STATUSES]
+    if started:
+        game = started[0]
+        box = tools.get_game_boxscore(game["away_name"].split()[-1], game["home_name"].split()[-1])
+        check(
+            "game boxscore: batters carry fantasy points",
+            "batters" in box and (not box["batters"] or "fantasy_points" in box["batters"][0]),
+        )
+    check("game boxscore unknown matchup -> error", "error" in tools.get_game_boxscore("Lakers", "Celtics"))
+
+
 def main() -> int:
     offline_checks()
     live_checks()
     cache_checks()
     tool_checks()
+    filter_checks()
+    live_feature_checks()
     print(f"\n{_passed} passed, {_failed} failed")
     return 1 if _failed else 0
 

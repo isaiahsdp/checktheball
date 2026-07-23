@@ -223,6 +223,23 @@ def normalize_leaders(rows: list[list[Any]]) -> list[dict[str, Any]]:
     return leaders
 
 
+def normalize_total_stat(raw: dict[str, Any]) -> dict[str, Any]:
+    """Typed-stats person payload (byDateRange, lastXGames, vsTeam) -> total line.
+
+    These types return a split per team plus an "All" grand total (sport id 0),
+    often duplicated. Pick the grand total; never sum, or duplicates double it.
+    """
+    people = raw.get("people", [])
+    stats_groups = people[0].get("stats", []) if people else []
+    splits = stats_groups[0].get("splits", []) if stats_groups else []
+    if not splits:
+        return {}
+    total = next((s for s in splits if s.get("sport", {}).get("id") == 0), None)
+    if total is None:
+        total = max(splits, key=lambda s: s.get("stat", {}).get("gamesPlayed", 0) or 0)
+    return total.get("stat", {})
+
+
 def normalize_splits(
     raw: dict[str, Any], group: str | None = None
 ) -> list[dict[str, Any]]:
