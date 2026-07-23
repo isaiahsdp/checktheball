@@ -109,24 +109,27 @@ def _date_range_stats(
     """Fetch a player's stats over a preset or custom range, MLB-aggregated.
 
     Returns (stats, scope_label, window_meta), or None for an unknown preset.
-    ``window_meta`` documents the queried window (and puts its numbers in the
-    result so an answer that cites "last 10 games" / "30 days" stays grounded).
+    ``window_meta`` documents the queried window and, crucially, exposes its
+    numbers (span size and year) so an answer that cites "last 10 games",
+    "30 days", or the year of a date range ("...in 2024") stays grounded. The
+    year is a real, queried fact; without it as a number the deterministic check
+    can't verify a year the model correctly states.
     """
     if start_date and end_date:
         raw = client.get_player_stats_by_date_range(player_id, start_date, end_date, group, season=int(start_date[:4]))
-        return normalizer.normalize_total_stat(raw), "date_range", {"start_date": start_date, "end_date": end_date}
+        return normalizer.normalize_total_stat(raw), "date_range", {"start_date": start_date, "end_date": end_date, "year": int(start_date[:4])}
     if date_range == "last_10_games":
         raw = client.get_player_last_x_games(player_id, 10, group, season=season)
-        return normalizer.normalize_total_stat(raw), "last_10_games", {"games": 10}
+        return normalizer.normalize_total_stat(raw), "last_10_games", {"games": 10, "year": season}
     if date_range == "last_30_days":
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
         raw = client.get_player_stats_by_date_range(player_id, start, end, group, season=datetime.now().year)
-        return normalizer.normalize_total_stat(raw), "last_30_days", {"days": 30, "start_date": start, "end_date": end}
+        return normalizer.normalize_total_stat(raw), "last_30_days", {"days": 30, "start_date": start, "end_date": end, "year": int(start[:4])}
     if date_range == "since_allstar":
         start, end = _second_half_range(season)
         raw = client.get_player_stats_by_date_range(player_id, start, end, group, season=season)
-        return normalizer.normalize_total_stat(raw), "since_allstar", {"start_date": start, "end_date": end}
+        return normalizer.normalize_total_stat(raw), "since_allstar", {"start_date": start, "end_date": end, "year": season}
     return None
 
 
