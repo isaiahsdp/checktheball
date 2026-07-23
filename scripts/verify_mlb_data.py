@@ -19,8 +19,10 @@ Exit code is 0 if every check passes, 1 otherwise.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 
@@ -124,6 +126,21 @@ def offline_checks() -> None:
     check("date-range normalizer: keys mapped (atBats->ab, homeRuns->hr)", hitters[0]["stats"]["ab"] == 3 and hitters[0]["stats"]["hr"] == 2 and hitters[0]["stats"]["bb"] == 1)
     check("date-range normalizer: empty payload -> []", normalizer.normalize_date_range_hitters({}) == [])
 
+    # normalize_total_stat picks the grand total, never sums the duplicate splits.
+    # With no "All" split (sport id 0), it falls back to the most-games split.
+    no_all = {"people": [{"stats": [{"splits": [
+        {"sport": {"id": 1}, "stat": {"gamesPlayed": 10, "homeRuns": 3}},
+        {"sport": {"id": 11}, "stat": {"gamesPlayed": 40, "homeRuns": 9}},
+    ]}]}]}
+    check("total_stat: no sport-0 split -> falls back to most-games split", normalizer.normalize_total_stat(no_all).get("homeRuns") == 9)
+    # When the "All" grand total (sport id 0) exists, it wins even with fewer games.
+    with_all = {"people": [{"stats": [{"splits": [
+        {"sport": {"id": 1}, "stat": {"gamesPlayed": 40, "homeRuns": 9}},
+        {"sport": {"id": 0}, "stat": {"gamesPlayed": 25, "homeRuns": 11}},
+    ]}]}]}
+    check("total_stat: sport-0 grand total preferred over more-games split", normalizer.normalize_total_stat(with_all).get("homeRuns") == 11)
+    check("total_stat: empty payload -> {}", normalizer.normalize_total_stat({}) == {})
+
 
 def live_checks() -> None:
     print("Live checks (real MLB Stats API)")
@@ -186,6 +203,31 @@ def cache_checks() -> None:
             check("unknown table rejected", False)
         except ValueError:
             check("unknown table rejected", True)
+
+        # log_query writes the query log row verbatim.
+        db.log_query("who won?", "The Yankees.", [{"name": "get_player_stat"}], 0.9, db_path)
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        try:
+            row = con.execute("SELECT * FROM queries ORDER BY id DESC LIMIT 1").fetchone()
+        finally:
+            con.close()
+        check(
+            "log_query: row written with question/answer/score",
+            row["question"] == "who won?" and row["answer"] == "The Yankees." and row["grounding_score"] == 0.9,
+        )
+        check("log_query: tool_calls stored as JSON", json.loads(row["tool_calls"]) == [{"name": "get_player_stat"}])
+
+        # write_cache upserts: the same key is replaced in place, not duplicated.
+        db.write_cache("games", "upsert_key", "mlb", {"v": 1}, db_path)
+        db.write_cache("games", "upsert_key", "mlb", {"v": 2}, db_path)
+        check("write_cache: same key replaced with newest payload", db.read_cache("games", "upsert_key", db_path=db_path) == {"v": 2})
+        con = sqlite3.connect(db_path)
+        try:
+            count = con.execute("SELECT COUNT(*) FROM games WHERE key = 'upsert_key'").fetchone()[0]
+        finally:
+            con.close()
+        check("write_cache: upsert leaves a single row (no duplicate)", count == 1)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -207,6 +249,12 @@ def tool_checks() -> None:
 
     split = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, split="home")
     check("get_player_stat split: Judge home HR == 31", split.get("value") == 31 and split.get("split") == "home")
+
+    # Pitching anchor (every other anchor is a hitter): Skubal's 2024 line.
+    pit_k = tools.get_player_stat("Tarik Skubal", "strikeOuts", season=2024, group="pitching")
+    check("get_player_stat pitching: Skubal 2024 K == 228", normalizer.to_number(pit_k.get("value")) == 228 and pit_k.get("group") == "pitching")
+    pit_w = tools.get_player_stat("Tarik Skubal", "wins", season=2024, group="pitching")
+    check("get_player_stat pitching: Skubal 2024 wins == 18", normalizer.to_number(pit_w.get("value")) == 18)
 
     # Error paths return an {"error": ...} dict rather than raising.
     check("unknown player -> error", "error" in tools.get_player_stat("Zzz Notreal", "homeRuns", season=2024))
@@ -231,11 +279,16 @@ def filter_checks() -> None:
     # date_range: all three presets + a custom window, MLB-aggregated.
     sa = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, date_range="since_allstar")
     check("date_range since_allstar: Judge 2024 HR == 24", sa.get("value") == 24 and sa.get("scope") == "since_allstar")
+    check("date_range since_allstar: real tool exposes year == 2024", sa.get("year") == 2024)
     custom = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, start_date="2024-06-01", end_date="2024-06-30")
     check("date_range custom Jun 2024: Judge HR == 11", custom.get("value") == 11)
+    # The real tool (not a fixture) must expose the queried year so a claim that
+    # states it stays grounded. Guards the tools.py -> grounding.py contract.
+    check("date_range custom: real tool exposes year == 2024", custom.get("year") == 2024)
     lastx = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, date_range="last_10_games")
     check("date_range last_10_games (2024): Judge HR == 5", lastx.get("value") == 5)
     check("date_range window meta embedded (games == 10)", lastx.get("games") == 10)
+    check("date_range last_10_games: real tool exposes year == 2024", lastx.get("year") == 2024)
 
     # opponent: native head-to-head, with team-name resolution.
     vs = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, opponent="Dodgers")

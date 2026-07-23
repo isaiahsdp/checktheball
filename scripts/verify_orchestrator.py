@@ -162,6 +162,34 @@ def round_cap() -> None:
     check("cap: answer still returned", result["answer"] == "forced final")
 
 
+def parallel_tool_calls() -> None:
+    tools = FakeTools()
+    # A single assistant turn requests two tools at once (parallel tool use).
+    two_at_once = _Response(
+        "tool_use",
+        [_ToolUse("a", "lookup", {"which": "first"}), _ToolUse("b", "lookup", {"which": "second"})],
+    )
+    client = FakeClient([two_at_once, answer("combined")])
+    result = answer_question("q", tools, client=client)
+
+    check(
+        "parallel: both tools executed, in order, in one round",
+        tools.calls == [("lookup", {"which": "first"}), ("lookup", {"which": "second"})],
+    )
+    check("parallel: both calls recorded", len(result["tool_calls_made"]) == 2)
+    check("parallel: both results captured", len(result["tool_results"]) == 2)
+    check("parallel: only two API calls (one round handled both tools)", len(client.messages.requests) == 2)
+
+    # Both tool_result blocks go back in a single user turn before the next round.
+    result_msg = client.messages.requests[1]["messages"][-1]
+    check("parallel: two tool_result blocks in one user turn", len(result_msg["content"]) == 2)
+    check(
+        "parallel: result blocks reference both tool_use ids",
+        {b["tool_use_id"] for b in result_msg["content"]} == {"a", "b"},
+    )
+    check("parallel: final answer returned", result["answer"] == "combined")
+
+
 def main() -> int:
     print("Orchestrator checks (scripted fake client, no API key needed)")
     single_tool()
@@ -170,6 +198,7 @@ def main() -> int:
     tool_returns_error()
     tool_raises()
     round_cap()
+    parallel_tool_calls()
     print(f"\n{_passed} passed, {_failed} failed")
     return 1 if _failed else 0
 
