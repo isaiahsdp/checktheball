@@ -34,6 +34,10 @@ name(s), season year(s), and any named award or milestone. Do NOT include the
 name of the stat category itself (e.g. "home runs", "batting average", "OPS",
 "RBIs", "stolen bases"). Those are labels, not values.
 
+Do NOT include calendar dates or date ranges (e.g. "June 30, 2025", "July 19 to
+Sept 30", "since the All-Star break") as values. They describe the time window a
+stat was measured over, not the stat itself.
+
 Skip subjective or evaluative statements ("a historic season", "MVP-caliber")
 and skip meta statements about your own ability ("I can't answer that", "my
 tools only cover MLB"). Those are not verifiable factual claims.
