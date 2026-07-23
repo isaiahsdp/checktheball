@@ -126,8 +126,12 @@ def get_player_last_x_games(
 def get_player_vs_team(
     player_id: int | str, opponent_team_id: int | str, season: int | None = None, group: str = "hitting"
 ) -> dict[str, Any]:
-    """A player's stats against one opponent team (MLB-computed head-to-head)."""
-    hydrate = f"stats(group=[{group}],type=[vsTeam],opposingTeamId={opponent_team_id}"
+    """A player's stats against one opponent team (MLB-computed head-to-head).
+
+    Uses ``vsTeamTotal`` (the aggregate line), not ``vsTeam``: the latter returns
+    per-matchup sub-splits with no grand total, which cannot be collapsed safely.
+    """
+    hydrate = f"stats(group=[{group}],type=[vsTeamTotal],opposingTeamId={opponent_team_id}"
     if season is not None:
         hydrate += f",season={season}"
     hydrate += ")"
