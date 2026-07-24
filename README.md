@@ -10,7 +10,7 @@ changing the core pipeline.
 
 ## Approach
 
-An LLM chooses which data lookup to run but never invents the numbers — the
+An LLM chooses which data lookup to run but never invents the numbers. The
 values come from the stats API through a typed data layer. A separate pass then
 extracts each factual claim from the answer and verifies it against the data
 that was actually retrieved.

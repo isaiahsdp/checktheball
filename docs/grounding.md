@@ -15,27 +15,39 @@ fraction of a claim set that is supported.
 
 ## Measured rate
 
-Run: `python scripts/run_eval.py` over an 18-question set (simple, comparison,
-leaderboard, split, projection, compound, opinion, and out-of-scope).
+Run `python scripts/run_eval.py` over the question set, which spans simple,
+comparison, leaderboard, split, projection, compound, opinion, date_range,
+opponent, live, fantasy, pitching, ambiguous, edge_case, and out-of-scope
+categories (35 questions). Claim extraction is a model call, so scores vary
+between runs; each run appends its summary to `docs/eval_history.md`, so the rate
+is tracked as a range rather than a single number.
+
+A recent run over the 35-question set (see `docs/eval_history.md` for the full
+history):
 
 | Metric | Value |
 |---|---|
-| Questions answered | 18 / 18 |
-| Claims checked | 58 |
-| Claims grounded | 55 |
-| Claim-level grounding | **0.948** |
-| Mean per-answer score | 0.987 |
-| Questions fully grounded | 17 / 18 |
+| Questions answered | 35 / 35 |
+| Claims checked | 98 |
+| Claims grounded | 96 |
+| Claim-level grounding | 0.980 |
+| Mean per-answer score | 0.994 |
+| Tool faithfulness | 27 / 28 |
+| Questions fully grounded | 33 / 35 |
 
-The single sub-1.0 answer was an opinion question ("who had the better season").
-All ten of its statistical claims were grounded; the flagged claims were
-editorial framing the model added from its own knowledge ("joined the 50-50
-club", "no one had done it in MLB history") that no tool returned. That is the
-grounding layer working as intended: the numbers are verified, and unverified
-context is surfaced rather than trusted.
+The sub-1.0 answers are typically opinion or evaluative questions where the model
+adds editorial framing from its own knowledge ("joined the 50-50 club", "no one
+had done it in MLB history") that no tool returned. The numbers are still
+verified; the unverified editorial context is flagged rather than silently
+trusted.
 
-Claim extraction is a model call, so exact counts vary slightly between runs;
-observed claim-level grounding sits around 0.92–0.95.
+Across runs, observed claim-level grounding sits around 0.92 to 0.98. Date-range
+answers were a source of false negatives: a claim that states the queried year
+("...in 2024") failed because the year lived only inside the tool result's date
+strings, not as a matchable number. Two changes fixed it. The extractor treats
+specific calendar dates and spans as context, not checkable values; and the
+date-range tools now put the queried year in their result, so a year the model
+correctly states is verifiable instead of missing.
 
 ## What the score does and doesn't capture
 
@@ -55,8 +67,14 @@ arguments (wrong season, wrong player), the tool returns correct-but-irrelevant
 data, and an answer built from that data still grounds. The tool calls are
 returned alongside each answer for transparency, so a reader can see what ran.
 
-A natural extension is a separate **query-faithfulness** check that compares the
-structured tool arguments (season, player, stat) against the question's intent.
-The deterministic version of that check is preferable to an LLM judge, for the
-same reason the grounding cross-check is deterministic: it avoids using one
-model to grade another.
+A scoped, deterministic **query-faithfulness** check now runs in
+`scripts/run_eval.py` (`check_tool_faithfulness`). Eval questions whose correct
+tool call is unambiguous carry an expected tool and key arguments; the run
+records whether the model used them and reports a tool-faithfulness rate
+separate from grounding. It is deterministic (no model judge), for the same
+reason the grounding cross-check is. It already surfaced a real case (an
+ambiguous surname) where grounding scored 1.0 but the model made no lookup.
+
+This is a first version tied to annotated eval questions. A general-purpose
+version that scores arbitrary live queries against inferred intent, rather than
+pre-annotated ones, is still future work.
