@@ -151,6 +151,23 @@ def ask_empty_and_whitespace() -> None:
     check("ask whitespace-only: 400 (handler guard)", blank.status_code == 400)
 
 
+def ask_too_long() -> None:
+    # A question over max_length is rejected by schema validation (422) before the
+    # handler runs, so the orchestrator is never reached (no wasted paid call).
+    called = {"n": 0}
+
+    def _spy(*args, **kwargs):
+        called["n"] += 1
+        return _ANSWER
+
+    orchestrator.answer_question = _spy
+    long_question = "a" * (main.MAX_QUESTION_LENGTH + 100)
+    with TestClient(main.app) as tc:
+        r = tc.post("/ask", json={"question": long_question})
+    check("ask too-long: 422 (schema validation)", r.status_code == 422)
+    check("ask too-long: orchestrator never invoked", called["n"] == 0)
+
+
 def ask_orchestrator_raises() -> None:
     orchestrator.answer_question = _answer_boom
     grounding.ground_answer = _grounding_ok  # must not be reached
@@ -159,6 +176,8 @@ def ask_orchestrator_raises() -> None:
         r = tc.post("/ask", json={"question": "boom"})
     check("orchestrator raises: 502", r.status_code == 502)
     check("orchestrator raises: nothing logged", _queries_count() == before)
+    # The exception detail ("orchestrator down") must not leak to the client.
+    check("orchestrator raises: response does not leak the exception", "orchestrator down" not in r.text)
 
 
 def ask_grounding_raises() -> None:
@@ -192,6 +211,26 @@ def games_live_fetch_raises() -> None:
         # Fresh date key so the cache can't serve a prior result.
         r = tc.get("/games/live", params={"date": "2024-06-02"})
     check("games fetch raises: 502", r.status_code == 502)
+    # The exception detail ("schedule down") must not leak to the client.
+    check("games fetch raises: response does not leak the exception", "schedule down" not in r.text)
+
+
+def ask_rate_limit() -> None:
+    # The per-IP /ask limit shares in-memory state across requests, so reset it
+    # to isolate this test from the other /ask checks, then fire more than the
+    # limit's worth in quick succession.
+    main.limiter.reset()
+    orchestrator.answer_question = _answer_ok
+    grounding.ground_answer = _grounding_ok
+    limit = main.ASK_RATE_LIMIT_PER_MINUTE
+    with TestClient(main.app) as tc:
+        responses = [tc.post("/ask", json={"question": "spam"}) for _ in range(limit + 2)]
+    codes = [r.status_code for r in responses]
+    check("rate limit: requests up to the limit succeed", codes[:limit] == [200] * limit)
+    check("rate limit: requests over the limit return 429", all(c == 429 for c in codes[limit:]))
+    over_body = responses[-1].json()
+    check("rate limit: 429 body is clean JSON (not a stack trace)", isinstance(over_body, dict) and "error" in over_body)
+    main.limiter.reset()  # leave the limiter clean for any later tests
 
 
 def main_() -> int:
@@ -200,8 +239,10 @@ def main_() -> int:
     try:
         ask_happy_path()
         ask_empty_and_whitespace()
+        ask_too_long()
         ask_orchestrator_raises()
         ask_grounding_raises()
+        ask_rate_limit()
         games_live_happy_path()
         games_live_fetch_raises()
     finally:

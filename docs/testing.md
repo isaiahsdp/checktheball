@@ -33,7 +33,7 @@ tests trustworthy.
 |---|---|---|---|
 | `scripts/verify_orchestrator.py` | 24 | none | the tool-use loop |
 | `scripts/verify_grounding.py` | 19 | none | the deterministic grounding check |
-| `scripts/verify_api.py` | 20 | none | the FastAPI endpoints |
+| `scripts/verify_api.py` | 27 | none | the FastAPI endpoints |
 | `scripts/verify_mlb_data.py` | 77 | live (anchored) | the MLB data layer, tools, filters, cache |
 | `scripts/run_eval.py` | 35 questions | live (models) | full-pipeline benchmark |
 
@@ -55,15 +55,18 @@ explicit), a multi-value claim where only some values are backed, negative
 numbers, whether text inside an `{"error": ...}` string can spuriously ground a
 claim, and a date-range claim that states the queried year.
 
-### verify_api.py (20, offline)
+### verify_api.py (27, offline)
 
 `TestClient` drives the app with the orchestrator and grounding calls faked and
 the database pointed at a temporary file. Covers `POST /ask` happy path
 (response shape plus a row landing in `queries`), empty question (422 from schema
-validation) vs whitespace-only (400 from the handler), the orchestrator raising
-(502, and nothing logged), grounding raising (still 200, score falls back to
-None, answer still returned and logged), `GET /games/live` happy path (live_count
-filters to `state == "live"`), and the schedule fetch raising (502).
+validation) vs whitespace-only (400 from the handler), an over-length question
+(422, orchestrator never invoked), the orchestrator raising (502, nothing logged,
+and the exception detail not leaked to the client), grounding raising (still 200,
+score falls back to None, answer still returned and logged), the per-IP rate
+limit (requests over the limit get a clean 429), `GET /games/live` happy path
+(live_count filters to `state == "live"`), and the schedule fetch raising (502,
+no leak).
 
 ### verify_mlb_data.py (77, mixed)
 

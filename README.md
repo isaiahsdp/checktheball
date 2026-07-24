@@ -19,7 +19,7 @@ that was actually retrieved.
 
 - `sports/<sport>/` — per-sport client, normalizer, and tools (MLB first)
 - `core/` — shared schema, orchestrator, grounding, and storage; no sport-specific imports
-- `api/` — FastAPI service
+- `api/` — FastAPI service; `POST /ask` (rate-limited per IP, since each call makes paid model requests) and `GET /games/live`
 - `frontend/` — React + Tailwind UI
 
 ## Stack

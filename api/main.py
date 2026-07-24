@@ -8,18 +8,35 @@ a client can show the answer alongside how well it traces back to the data.
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from core import db, grounding, orchestrator
 from sports.mlb import client, normalizer
 from sports.mlb import tools as mlb_tools
 
+logger = logging.getLogger(__name__)
+
 # The schedule changes as games start and scores move, so keep the cache short.
 LIVE_GAMES_MAX_AGE_SECONDS = 30
+
+# Cap question length: long enough for any real sports question, short enough to
+# reject a huge pasted block meant to burn tokens on a call that would fail anyway.
+MAX_QUESTION_LENGTH = 500
+
+# /ask triggers paid Anthropic calls, so cap it per client IP: a burst limit to
+# stop a bot loop or spam-click, and a daily limit to bound total spend per IP.
+ASK_RATE_LIMIT_PER_MINUTE = 5
+ASK_RATE_LIMIT_PER_DAY = 50
+ASK_RATE_LIMIT = f"{ASK_RATE_LIMIT_PER_MINUTE}/minute;{ASK_RATE_LIMIT_PER_DAY}/day"
+limiter = Limiter(key_func=get_remote_address)
 
 
 @asynccontextmanager
@@ -29,6 +46,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CheckTheBall", version="0.1.0", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 @app.get("/health")
@@ -52,8 +71,10 @@ def games_live(date: str | None = None) -> dict:
         games = db.cached_fetch(
             "games", key, normalizer.SPORT, fetch, LIVE_GAMES_MAX_AGE_SECONDS
         )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Schedule lookup failed: {exc}")
+    except Exception:
+        # Log the real detail server-side; don't leak internals to the client.
+        logger.exception("Schedule lookup failed")
+        raise HTTPException(status_code=502, detail="Could not load games right now.")
 
     live = [g for g in games if g["state"] == "live"]
     return {
@@ -65,20 +86,28 @@ def games_live(date: str | None = None) -> dict:
 
 
 class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1, description="A natural-language sports question.")
+    question: str = Field(
+        ..., min_length=1, max_length=MAX_QUESTION_LENGTH, description="A natural-language sports question."
+    )
 
 
 @app.post("/ask")
-def ask(req: AskRequest) -> dict:
-    """Answer a question from real data and report how grounded the answer is."""
+@limiter.limit(ASK_RATE_LIMIT)
+def ask(request: Request, req: AskRequest) -> dict:
+    """Answer a question from real data and report how grounded the answer is.
+
+    Rate-limited per client IP because each call makes paid model requests.
+    """
     question = req.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question must not be empty.")
 
     try:
         answered = orchestrator.answer_question(question, mlb_tools)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Answering failed: {exc}")
+    except Exception:
+        # Log the real detail server-side; don't leak internals to the client.
+        logger.exception("Answering failed")
+        raise HTTPException(status_code=502, detail="Could not answer the question right now.")
 
     # Grounding is best-effort: a scoring failure shouldn't drop a good answer.
     try:
