@@ -17,12 +17,13 @@ fraction of a claim set that is supported.
 
 Run `python scripts/run_eval.py` over the question set, which spans simple,
 comparison, leaderboard, split, projection, compound, opinion, date_range,
-opponent, live, fantasy, pitching, ambiguous, edge_case, and out-of-scope
-categories (35 questions). Claim extraction is a model call, so scores vary
-between runs; each run appends its summary to `docs/eval_history.md`, so the rate
-is tracked as a range rather than a single number.
+opponent, live, date_awareness, fantasy, pitching, ambiguous, edge_case, and
+out-of-scope categories (40 questions). Claim extraction is a model call, so
+scores vary between runs; each run appends its summary to `docs/eval_history.md`,
+so the rate is tracked as a range rather than a single number.
 
-A recent run over the 35-question set (see `docs/eval_history.md` for the full
+A recent run (over the question set as it stood at 35 questions, before the two
+date_awareness questions were added; see `docs/eval_history.md` for the full
 history):
 
 | Metric | Value |
@@ -41,7 +42,8 @@ had done it in MLB history") that no tool returned. The numbers are still
 verified; the unverified editorial context is flagged rather than silently
 trusted.
 
-Across runs, observed claim-level grounding sits around 0.92 to 0.98. Date-range
+Across the runs logged in `docs/eval_history.md`, claim-level grounding has
+ranged from 0.980 to 0.989. Date-range
 answers were a source of false negatives: a claim that states the queried year
 ("...in 2024") failed because the year lived only inside the tool result's date
 strings, not as a matchable number. Two changes fixed it. The extractor treats
@@ -57,6 +59,16 @@ correctly states is verifiable instead of missing.
   numeric check can in principle accept a number that is correct but attached to
   the wrong label. Verification is intentionally strict on numbers and lenient
   on descriptive phrasing.
+- It recognizes a **simple derived rate** as supported: a number the model got by
+  dividing two grounded numbers (e.g. "9.0 strikeouts per game" from 18
+  strikeouts over 2 games). The rate itself was never returned by a tool, but
+  both inputs were. This differs from fantasy points, which `sports/mlb/
+  fantasy.py` computes deterministically in code *before* the answer is written;
+  the derived-rate check instead verifies, after the fact, a ratio the model
+  already stated. It is division only (the demonstrated rate/average case) and
+  reuses the strict numeric tolerance so unrelated pairs don't coincidentally
+  match; values grounded this way are listed in each claim's `derived` field so a
+  false positive stays traceable.
 
 ## Limitations and future work
 
