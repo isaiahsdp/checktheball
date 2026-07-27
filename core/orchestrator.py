@@ -13,6 +13,7 @@ loop drives MLB, NBA, or any future sport.
 from __future__ import annotations
 
 import json
+from datetime import date
 from typing import Any, Protocol
 
 import anthropic
@@ -24,15 +25,32 @@ MAX_TOKENS = 4096
 # Safety valve so a confused model can't loop forever calling tools.
 MAX_TOOL_ROUNDS = 6
 
-SYSTEM_PROMPT = """\
+# {current_date} is filled in per request (see _system_blocks): the model must
+# resolve "this season" against the real date, not its training horizon.
+_SYSTEM_PROMPT_TEMPLATE = """\
 You are CheckTheBall, a sports statistics assistant. You answer questions using \
 ONLY verified data returned by your tools.
+
+Today's date is {current_date}. Use it to resolve relative time references like \
+"this season", "today", "current", or "latest" against the real world; do not \
+assume a season based on your own training data.
 
 Rules:
 - Never state a statistic, score, or factual claim from your own memory. Every \
 number in your answer must come from a tool result in this conversation.
+- A number you calculate yourself (a sum, difference, percentage, per-game rate, \
+or projection over extra games) is not verified data. Prefer a tool that computes \
+it. If you must mention one, show the grounded tool numbers it comes from, and \
+never present a multi-step estimate or projection as a precise figure. If the \
+number the question centers on cannot come from a tool, say so plainly instead \
+of computing it yourself.
 - Call the appropriate tool(s) to get the data you need. For compound questions, \
 call multiple tools and combine their results.
+- Do not assume that data for the current or a recent season doesn't exist yet. \
+Your training has a cutoff, but the tools query live data that is more current \
+than that. If you are unsure whether a season or date has data, call the tool \
+and let the actual result tell you; never claim data "likely doesn't exist" \
+without having tried the lookup.
 - If a tool result contains an "error" field, do not invent an answer. Tell the \
 user what went wrong or that the data isn't available.
 - If the question cannot be answered with the available tools (a sport or data \
@@ -44,13 +62,21 @@ your conclusion.
 - Be concise and factual. Any number you state must match a tool result exactly.
 """
 
-# The system prompt and tool schemas are identical on every request, so we mark
-# them cacheable. The breakpoint sits on the system block, which caches the tool
-# schemas ahead of it too; each extra loop round and each later question reuses
-# the prefix instead of reprocessing it.
-_SYSTEM_BLOCKS = [
-    {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
-]
+
+def _system_blocks() -> list[dict[str, Any]]:
+    """System block(s) for one request, with the current date embedded.
+
+    Built per request (not once at import) so the date reflects the real request
+    date, not process startup, which matters for a long-running server. The block
+    stays cacheable: the date changes at most once a day, so embedding it turns
+    the "never changes" prompt into one that changes daily. In practice that means
+    a cache miss only on the first request after a date rollover (or normal TTL
+    expiry), then cache hits again, rather than the previous never-miss case. The
+    breakpoint still sits on the system block, so the tool schemas ahead of it and
+    every extra loop round within a request reuse the cached prefix.
+    """
+    prompt = _SYSTEM_PROMPT_TEMPLATE.format(current_date=date.today().isoformat())
+    return [{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}]
 
 
 class ToolProvider(Protocol):
@@ -89,6 +115,9 @@ def answer_question(
     tool_calls_made: list[dict[str, Any]] = []
     tool_results: list[dict[str, Any]] = []
 
+    # Built once per request so every round shares one date and reuses the cache.
+    system_blocks = _system_blocks()
+
     response = None
     for round_index in range(max_tool_rounds + 1):
         # On the final allowed round, forbid further tool calls so the model
@@ -97,7 +126,7 @@ def answer_question(
         request: dict[str, Any] = {
             "model": model,
             "max_tokens": MAX_TOKENS,
-            "system": _SYSTEM_BLOCKS,
+            "system": system_blocks,
             "tools": tools.TOOL_SCHEMAS,
             "messages": messages,
         }
