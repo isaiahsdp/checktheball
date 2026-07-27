@@ -210,6 +210,74 @@ def date_range_year_claim() -> None:
     check("date-range+year claim: year unverifiable when result omits it", c["supported"] is False and c["missing"] == ["2024"])
 
 
+def derived_rate_claim() -> None:
+    # A rate the model computes itself: 18 strikeouts over 2 games -> 9.0 per
+    # game. 9.0 was never returned by a tool, but both inputs are grounded, so
+    # the ratio fallback supports it (mirrors fantasy.py's derived stats, but
+    # verified after the fact instead of computed ahead of time).
+    tool_results = [{"name": "get_player_stat", "input": {}, "result": {
+        "player": "Tarik Skubal", "strikeOuts": 18, "gamesPlayed": 2}}]
+    ok = ground_answer("…", tool_results, client=FakeExtractor(
+        [{"text": "That is 9.0 strikeouts per game", "values": ["9.0"]}]))
+    c = ok["claims"][0]
+    check("derived rate: 18/2 = 9.0 grounds via a computed ratio", c["supported"] is True)
+    check("derived rate: ratio match flagged in `derived`, not silent", c.get("derived") == ["9.0"])
+
+    # Contrast (false-positive guard): a derived-looking number that is not any
+    # real ratio of the corpus stays unsupported.
+    bad = ground_answer("…", tool_results, client=FakeExtractor(
+        [{"text": "That is 7.5 strikeouts per game", "values": ["7.5"]}]))
+    check("derived rate: 7.5 is no ratio of 18 and 2, still flagged unsupported", bad["supported_claims"] == 0)
+
+    # A directly-present number must not be mislabeled as derived.
+    direct = ground_answer("…", tool_results, client=FakeExtractor(
+        [{"text": "He had 18 strikeouts", "values": ["18"]}]))
+    check("derived rate: a direct match is not tagged derived", "derived" not in direct["claims"][0])
+
+
+def leaderboard_gap_claim() -> None:
+    # A leaderboard answer states the gap behind the leader ("trailed by 14").
+    # get_top_performers now precomputes gap_from_leader, so the number grounds
+    # via the normal direct-match path, not grounding's division fallback. This
+    # is the fix landing at the source (tools.py), with no grounding.py change.
+    tool_results = [{"name": "get_top_performers", "input": {}, "result": {
+        "scope": "season", "stat": "strikeOuts", "season": 2024, "leaders": [
+            {"player": "Garrett Crochet", "value": 255, "gap_from_leader": 0},
+            {"player": "Tarik Skubal", "value": 241, "gap_from_leader": 14},
+        ]}}]
+    claim = [{"text": "Skubal trailed the strikeout leader by 14", "values": ["Tarik Skubal", "14"]}]
+    g = ground_answer("…", tool_results, client=FakeExtractor(claim))
+    c = g["claims"][0]
+    check("leaderboard gap: 'trailed by 14' grounds via precomputed gap_from_leader", c["supported"] is True)
+    check("leaderboard gap: 14 matched directly, not via the derived-ratio fallback", "derived" not in c)
+
+
+def derived_ratio_widens_with_corpus_size() -> None:
+    # Documents a known limitation, in the style of value_only_in_input. The
+    # ratio fallback tries every ordered pair, so the set of numbers it accepts
+    # grows with the square of the retrieved data. Against a two-number result,
+    # 22 is correctly rejected; against an ordinary five-row leaderboard it
+    # grounds as a coincidental ratio (44 / 2) despite no tool returning it.
+    # This is why a predictable derived value belongs in the tool output
+    # (gap_from_leader) rather than in a wider arithmetic fallback.
+    small = [{"name": "get_player_stat", "input": {}, "result": {"value": 44, "gamesPlayed": 2}}]
+    tight = ground_answer("…", small, client=FakeExtractor([{"text": "he hit 22", "values": ["22"]}]))
+    check("derived ratio: 22 grounds against a corpus that really contains 44 and 2", tight["supported_claims"] == 1)
+
+    leaderboard = [{"name": "get_top_performers", "input": {"stat": "homeRuns", "season": 2024, "limit": 5}, "result": {
+        "scope": "season", "stat": "homeRuns", "season": 2024, "limit": 5, "leaders": [
+            {"rank": 1, "player": "A", "value": 58, "gap_from_leader": 0},
+            {"rank": 2, "player": "B", "value": 54, "gap_from_leader": 4},
+            {"rank": 3, "player": "C", "value": 48, "gap_from_leader": 10},
+            {"rank": 4, "player": "D", "value": 47, "gap_from_leader": 11},
+            {"rank": 5, "player": "E", "value": 44, "gap_from_leader": 14},
+        ]}}]
+    wide = ground_answer("…", leaderboard, client=FakeExtractor([{"text": "he hit 22", "values": ["22"]}]))
+    c = wide["claims"][0]
+    check("derived ratio: a leaderboard-sized corpus accepts 22 as a coincidental ratio", c["supported"] is True)
+    check("derived ratio: the coincidental match is tagged derived, so it stays traceable", c.get("derived") == ["22"])
+
+
 def main() -> int:
     print("Grounding checks (scripted extractor, no API key needed)")
     all_grounded()
@@ -222,6 +290,9 @@ def main() -> int:
     negative_number()
     error_message_grounding()
     date_range_year_claim()
+    derived_rate_claim()
+    leaderboard_gap_claim()
+    derived_ratio_widens_with_corpus_size()
     print(f"\n{_passed} passed, {_failed} failed")
     return 1 if _failed else 0
 

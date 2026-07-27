@@ -233,6 +233,22 @@ def ask_rate_limit() -> None:
     main.limiter.reset()  # leave the limiter clean for any later tests
 
 
+def ask_daily_limit_registered() -> None:
+    # The daily limb can't be driven behaviourally: the per-minute limb trips at
+    # 6 requests, so the 50th is unreachable inside one minute. Assert instead
+    # that both limbs are registered on the route, which is what would break if
+    # the ";50/day" half of the composed limit string were ever dropped.
+    registered = [str(limit.limit) for limit in main.limiter._route_limits["api.main.ask"]]
+    check(
+        "rate limit: per-minute limb registered on /ask",
+        f"{main.ASK_RATE_LIMIT_PER_MINUTE} per 1 minute" in registered,
+    )
+    check(
+        "rate limit: per-day limb registered on /ask (bounds spend per IP)",
+        f"{main.ASK_RATE_LIMIT_PER_DAY} per 1 day" in registered,
+    )
+
+
 def main_() -> int:
     db.init_db()  # ensure the queries table exists before the first count
     print("API checks (TestClient, injected fakes, temp DB, no network)")
@@ -243,6 +259,7 @@ def main_() -> int:
         ask_orchestrator_raises()
         ask_grounding_raises()
         ask_rate_limit()
+        ask_daily_limit_registered()
         games_live_happy_path()
         games_live_fetch_raises()
     finally:

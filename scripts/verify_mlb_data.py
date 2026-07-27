@@ -25,6 +25,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from datetime import datetime
 
 # Make the project importable when run as a plain script.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -92,6 +93,17 @@ def offline_checks() -> None:
     check("fantasy points on Judge 2024 line == 1871", fantasy.hitter_points(judge) == 1871)
     check("fantasy points on empty line == 0", fantasy.hitter_points({}) == 0)
 
+    # Pitcher fantasy: hand-computed DraftKings classic lines.
+    # 6.2 IP (= 6 2/3): 6.667*2.25 + 7*2 - 3*2 - 6*0.6 - 2*0.6 - 1*0.6
+    #                 = 15.0 + 14 - 6 - 3.6 - 1.2 - 0.6 = 17.6
+    pline = {"ip": "6.2", "k": 7, "w": 0, "er": 3, "h": 6, "bb": 2, "hbp": 1}
+    check("pitcher fantasy on 6.2 IP line == 17.6", fantasy.pitcher_points(pline) == 17.6)
+    # No-hit complete-game shutout with a win: 9*2.25 + 12*2 + 4 - 1*0.6
+    #                 + 2.5 (CG) + 2.5 (CG shutout) + 5 (no-hitter) = 57.65
+    gem = {"ip": "9.0", "k": 12, "w": 1, "er": 0, "h": 0, "bb": 1, "cg": 1, "cgso": 1, "nh": 1}
+    check("pitcher fantasy on no-hit CG shutout == 57.65", fantasy.pitcher_points(gem) == 57.65)
+    check("pitcher fantasy on empty line == 0", fantasy.pitcher_points({}) == 0)
+
     # Box-score normalizer: skip header rows, use full names, drop season rates.
     box = {
         "teamInfo": {
@@ -126,6 +138,19 @@ def offline_checks() -> None:
     check("date-range normalizer: keys mapped (atBats->ab, homeRuns->hr)", hitters[0]["stats"]["ab"] == 3 and hitters[0]["stats"]["hr"] == 2 and hitters[0]["stats"]["bb"] == 1)
     check("date-range normalizer: empty payload -> []", normalizer.normalize_date_range_hitters({}) == [])
 
+    # Date-range pitching normalizer: maps MLB pitching stat names, coerces values
+    # (inningsPitched "7.0" -> 7.0 via to_number).
+    date_range_pitch = {"stats": [{"splits": [
+        {"player": {"fullName": "Tarik Skubal"}, "team": {"name": "Detroit Tigers"},
+         "stat": {"strikeOuts": 9, "inningsPitched": "7.0", "earnedRuns": 1,
+                  "baseOnBalls": 2, "hits": 4}},
+    ]}]}
+    pitchers = normalizer.normalize_date_range_pitchers(date_range_pitch)
+    check("date-range pitching normalizer: one pitcher", len(pitchers) == 1)
+    check("date-range pitching normalizer: name and team", pitchers[0]["player"] == "Tarik Skubal" and pitchers[0]["team"] == "Detroit Tigers")
+    check("date-range pitching normalizer: fields mapped and coerced", pitchers[0]["stats"]["strikeOuts"] == 9 and pitchers[0]["stats"]["earnedRuns"] == 1 and pitchers[0]["stats"]["inningsPitched"] == 7.0)
+    check("date-range pitching normalizer: empty payload -> []", normalizer.normalize_date_range_pitchers({}) == [])
+
     # normalize_total_stat picks the grand total, never sums the duplicate splits.
     # With no "All" split (sport id 0), it falls back to the most-games split.
     no_all = {"people": [{"stats": [{"splits": [
@@ -140,6 +165,26 @@ def offline_checks() -> None:
     ]}]}]}
     check("total_stat: sport-0 grand total preferred over more-games split", normalizer.normalize_total_stat(with_all).get("homeRuns") == 11)
     check("total_stat: empty payload -> {}", normalizer.normalize_total_stat({}) == {})
+
+    # gap_from_leader is a magnitude. In a lower-is-better category the leader
+    # holds the smallest value, so a signed subtraction would hand the model a
+    # negative "gap" to cite.
+    era_board = [{"value": 1.90}, {"value": 2.40}, {"value": 2.75}]
+    tools._add_gap_from_leader(era_board)
+    check("gap_from_leader: lower-is-better gaps stay positive", [e["gap_from_leader"] for e in era_board] == [0.0, 0.5, 0.85])
+    hr_board = [{"value": 58}, {"value": 54}, {"value": 48}]
+    tools._add_gap_from_leader(hr_board)
+    check("gap_from_leader: higher-is-better gaps unchanged", [e["gap_from_leader"] for e in hr_board] == [0, 4, 10])
+    odd_board = [{"value": 5}, {"value": "-.--"}]
+    tools._add_gap_from_leader(odd_board)
+    check("gap_from_leader: non-numeric leaderboard left untouched", all("gap_from_leader" not in e for e in odd_board))
+
+    # The rate-stat classifier must catch both the named stats and the families
+    # (percentage / average / per9 / ...) without swallowing counting stats.
+    rates = ("avg", "obp", "ops", "era", "whip", "battingAverage", "stolenBasePercentage", "strikeoutsPer9Inn")
+    counting = ("homeRuns", "hits", "rbi", "strikeOuts", "wins", "stolenBases", "gamesPlayed", "inningsPitched")
+    check("rate-stat classifier: named rates and rate families detected", all(tools._is_rate_stat(s) for s in rates))
+    check("rate-stat classifier: counting stats not caught", not any(tools._is_rate_stat(s) for s in counting))
 
 
 def live_checks() -> None:
@@ -243,9 +288,49 @@ def tool_checks() -> None:
 
     top = tools.get_top_performers("homeRuns", season=2024, limit=5)
     check("get_top_performers: Judge is #1 with 58", top["leaders"][0]["value"] == 58)
+    # gap_from_leader is precomputed so the model cites it instead of subtracting.
+    check("get_top_performers: leader gap_from_leader == 0", top["leaders"][0]["gap_from_leader"] == 0)
+    check("get_top_performers: #2 gap_from_leader == 4 (58 - 54)", top["leaders"][1]["value"] == 54 and top["leaders"][1]["gap_from_leader"] == 4)
 
     pace = tools.compute_pace_projection("Aaron Judge", "homeRuns", season=2024)
     check("compute_pace_projection: 58 in 158 G -> 59.5", pace.get("projected_value") == round(58 / 158 * 162, 1))
+    # Pitching pace uses season-fraction (not games x 162, which would overcount
+    # ~5x). A completed season is fully elapsed, so it projects to the real total.
+    ppace = tools.compute_pace_projection("Tarik Skubal", "strikeOuts", season=2024, group="pitching")
+    check(
+        "compute_pace_projection pitching: Skubal 2024 K projects to 228 (completed season)",
+        ppace.get("projected_value") == 228 and ppace.get("group") == "pitching",
+    )
+
+    # Rate stats are documented as unprojectable in both the docstring and the
+    # tool schema; the tool must reject them rather than return a scaled,
+    # meaningless number (avg .322 would otherwise "project" to 0.3).
+    # The error must be the rate-stat rejection specifically: a stat that simply
+    # isn't in the season line also errors, which would make this pass for the
+    # wrong reason.
+    for rate in ("avg", "ops", "battingAverage"):
+        rejected = tools.compute_pace_projection("Aaron Judge", rate, season=2024)
+        check(f"compute_pace_projection rejects rate stat '{rate}'", "rate" in rejected.get("error", "") and "projected_value" not in rejected)
+    era_rejected = tools.compute_pace_projection("Tarik Skubal", "era", season=2024, group="pitching")
+    check("compute_pace_projection rejects rate stat 'era' (pitching)", "rate" in era_rejected.get("error", "") and "projected_value" not in era_rejected)
+
+    # The completed-season anchor above only exercises fraction == 1.0, where
+    # value / fraction is the identity. Swap in a partial season to cover the
+    # scaling arithmetic and the not-started guard deterministically, year-round.
+    real_fraction = tools._season_fraction_elapsed
+    try:
+        tools._season_fraction_elapsed = lambda season: 0.5
+        half = tools.compute_pace_projection("Tarik Skubal", "strikeOuts", season=2024, group="pitching")
+        check(
+            "compute_pace_projection pitching: 228 K at half a season projects to 456",
+            half.get("projected_value") == 456.0 and half.get("season_fraction_elapsed") == 0.5,
+        )
+        tools._season_fraction_elapsed = lambda season: 0.0
+        unstarted = tools.compute_pace_projection("Tarik Skubal", "strikeOuts", season=2024, group="pitching")
+        check("compute_pace_projection pitching: an unstarted season is rejected", "error" in unstarted)
+    finally:
+        tools._season_fraction_elapsed = real_fraction
+    check("season fraction of a completed season is 1.0", tools._season_fraction_elapsed(2024) == 1.0)
 
     split = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, split="home")
     check("get_player_stat split: Judge home HR == 31", split.get("value") == 31 and split.get("split") == "home")
@@ -255,6 +340,14 @@ def tool_checks() -> None:
     check("get_player_stat pitching: Skubal 2024 K == 228", normalizer.to_number(pit_k.get("value")) == 228 and pit_k.get("group") == "pitching")
     pit_w = tools.get_player_stat("Tarik Skubal", "wins", season=2024, group="pitching")
     check("get_player_stat pitching: Skubal 2024 wins == 18", normalizer.to_number(pit_w.get("value")) == 18)
+
+    # Pitcher fantasy, season path: Skubal's completed-2024 line scores 746.4 DK
+    # points (192 IP, 228 K, 18 W, 51 ER, 142 H, 35 BB, 9 HBP), an immutable anchor.
+    skubal_fp = tools.get_fantasy_points("Tarik Skubal", season=2024, group="pitching")
+    check(
+        "get_fantasy_points pitching: Skubal 2024 == 746.4",
+        skubal_fp.get("fantasy_points") == 746.4 and skubal_fp.get("scope") == "season" and skubal_fp.get("group") == "pitching",
+    )
 
     # Error paths return an {"error": ...} dict rather than raising.
     check("unknown player -> error", "error" in tools.get_player_stat("Zzz Notreal", "homeRuns", season=2024))
@@ -289,6 +382,28 @@ def filter_checks() -> None:
     check("date_range last_10_games (2024): Judge HR == 5", lastx.get("value") == 5)
     check("date_range window meta embedded (games == 10)", lastx.get("games") == 10)
     check("date_range last_10_games: real tool exposes year == 2024", lastx.get("year") == 2024)
+    # last_30_days is the one preset that can't be anchored: its window is always
+    # the real last 30 days, and a player who hasn't played in it returns a clean
+    # error. Assert the metadata contract instead of a number, and check the year
+    # against the window's own start date so the check can't flake in January.
+    l30 = tools.get_player_stat("Shohei Ohtani", "homeRuns", date_range="last_30_days")
+    if "error" in l30:
+        check("date_range last_30_days: clean no-data message", "no data" in l30["error"].lower())
+    else:
+        check(
+            "date_range last_30_days: window meta embedded (days == 30, year matches start_date)",
+            l30.get("scope") == "last_30_days" and l30.get("days") == 30 and l30.get("year") == int(l30["start_date"][:4]),
+        )
+
+    # A custom window needs both ends. Supplying one alone used to skip the range
+    # branch entirely and return the full-season line, answering a different
+    # question with no error and a grounding score of 1.0.
+    check("custom window: start_date without end_date -> error", "error" in tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, start_date="2024-06-01"))
+    check("custom window: end_date without start_date -> error", "error" in tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, end_date="2024-06-30"))
+    check(
+        "custom window: half a window rejected through compare_players too",
+        "error" in tools.compare_players("Aaron Judge", "Shohei Ohtani", "homeRuns", season=2024, start_date="2024-06-01"),
+    )
 
     # opponent: native head-to-head, with team-name resolution.
     vs = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, opponent="Dodgers")
@@ -303,11 +418,31 @@ def filter_checks() -> None:
     fp = tools.get_fantasy_points("Aaron Judge", season=2024)
     check("season fantasy 2024: Judge == 1871", fp.get("fantasy_points") == 1871 and fp.get("scope") == "season")
 
+    # fantasy: opponent path, anchored to the same Judge-vs-Dodgers-2024 line as
+    # the opponent hitting check above (hr == 3). That line scores 70 DK points.
+    fvs = tools.get_fantasy_points("Aaron Judge", season=2024, opponent="Dodgers")
+    check(
+        "opponent fantasy 2024: Judge vs Dodgers == 70 (line hr == 3)",
+        fvs.get("fantasy_points") == 70 and fvs.get("line", {}).get("hr") == 3
+        and fvs.get("scope") == "vs_team" and fvs.get("opponent") == "Los Angeles Dodgers",
+    )
+    check("opponent fantasy: opponent + date rejected", "error" in tools.get_fantasy_points("Aaron Judge", opponent="Dodgers", date="2024-06-01"))
+    check("opponent fantasy: unknown team -> error", "error" in tools.get_fantasy_points("Aaron Judge", opponent="Nonexistent FC", season=2024))
+
     # merged leaderboard, season scope.
     lb = tools.get_top_performers("homeRuns", scope="season", season=2024, limit=3)
     check(
         "leaderboard scope=season: Judge #1 with 58",
         lb["leaders"][0]["player"] == "Aaron Judge" and lb["leaders"][0]["value"] == 58 and lb["scope"] == "season",
+    )
+
+    # Lower-is-better leaderboard against the real tool: the 2024 ERA leaders are
+    # Sale 2.38, Skubal 2.39, Wheeler 2.57, so the gaps must read as positive
+    # magnitudes rather than the negatives a signed subtraction would produce.
+    era_lb = tools.get_top_performers("earnedRunAverage", scope="season", season=2024, limit=3, group="pitching")
+    check(
+        "leaderboard ERA 2024: gap_from_leader positive for a lower-is-better category",
+        [leader["gap_from_leader"] for leader in era_lb["leaders"]] == [0.0, 0.01, 0.19],
     )
 
     # compare over a window keeps the window scope.
@@ -330,10 +465,38 @@ def live_feature_checks() -> None:
     else:
         check("today leaderboard: scope today with leaders", today.get("scope") == "today" and len(today["leaders"]) > 0)
         check("today leaderboard: leaders carry fantasy_points", all("fantasy_points" in leader for leader in today["leaders"]))
+        # The today paths must actually emit gap_from_leader, not just be capable
+        # of being grounded against it in a fixture.
+        check(
+            "today leaderboard: leaders carry gap_from_leader, leader at 0",
+            all("gap_from_leader" in leader for leader in today["leaders"]) and today["leaders"][0]["gap_from_leader"] == 0,
+        )
 
     fantasy = tools.get_top_performers("fantasy", scope="today", limit=3)
     if "error" not in fantasy:
         check("today fantasy: scoring system labeled", fantasy.get("scoring") == "DraftKings classic")
+
+    # Today's pitching leaderboard (strikeouts): same off-day-tolerant pattern.
+    pitch_today = tools.get_top_performers("strikeOuts", scope="today", group="pitching", limit=3)
+    if "error" in pitch_today:
+        check("today pitching leaderboard: clean no-games message", "no games" in pitch_today["error"].lower())
+    else:
+        check(
+            "today pitching leaderboard: scope today, group pitching, with leaders",
+            pitch_today.get("scope") == "today" and pitch_today.get("group") == "pitching" and len(pitch_today["leaders"]) > 0,
+        )
+        check(
+            "today pitching leaderboard: leaders carry player/team/value/line",
+            all({"player", "team", "value", "line"} <= set(l) and "strikeOuts" in l["line"] for l in pitch_today["leaders"]),
+        )
+        check(
+            "today pitching leaderboard: leaders carry gap_from_leader, leader at 0",
+            all("gap_from_leader" in l for l in pitch_today["leaders"]) and pitch_today["leaders"][0]["gap_from_leader"] == 0,
+        )
+    # Deterministic (games or not): an unsupported pitching stat is rejected, so
+    # the tool doesn't imply a composite best-performance ranking exists.
+    bad_pitch = tools.get_top_performers("era", scope="today", group="pitching")
+    check("today pitching leaderboard: unsupported stat rejected cleanly", "error" in bad_pitch and "available_stats" in bad_pitch)
 
     started = [g for g in tools._cached_schedule(None) if g.get("status") in tools._STARTED_STATUSES]
     if started:

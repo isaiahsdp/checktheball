@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -190,6 +191,45 @@ def parallel_tool_calls() -> None:
     check("parallel: final answer returned", result["answer"] == "combined")
 
 
+def system_prompt_has_date() -> None:
+    # The prompt must carry the real current date so the model resolves "this
+    # season" against reality. Guards against a revert to a static, date-blind
+    # prompt (the bug where 2026 questions were answered with 2024 data, or
+    # dismissed as "data doesn't exist yet").
+    tools = FakeTools()
+    client = FakeClient([answer("ok")])
+    answer_question("q", tools, client=client)
+    system_text = client.messages.requests[0]["system"][0]["text"]
+    check("system: request carries today's date", date.today().isoformat() in system_text)
+    check(
+        "system: warns not to assume recent-season data is missing",
+        'likely doesn\'t exist' in system_text,
+    )
+
+
+def system_prompt_forbids_own_math() -> None:
+    # The rule that a number the model works out itself is not verified data. It
+    # is what motivates gap_from_leader in the tools and the derived-ratio
+    # fallback in grounding, so a silent edit to it would quietly change what the
+    # rest of the pipeline is compensating for.
+    tools = FakeTools()
+    client = FakeClient([answer("ok")])
+    answer_question("q", tools, client=client)
+    system_text = client.messages.requests[0]["system"][0]["text"]
+    check(
+        "system: a self-calculated number is not verified data",
+        "A number you calculate yourself" in system_text,
+    )
+    check(
+        "system: names the operations the rule covers",
+        all(word in system_text for word in ("sum", "difference", "percentage", "per-game rate", "projection")),
+    )
+    check(
+        "system: points the model at a tool that computes it instead",
+        "Prefer a tool that computes" in system_text,
+    )
+
+
 def main() -> int:
     print("Orchestrator checks (scripted fake client, no API key needed)")
     single_tool()
@@ -199,6 +239,8 @@ def main() -> int:
     tool_raises()
     round_cap()
     parallel_tool_calls()
+    system_prompt_has_date()
+    system_prompt_forbids_own_math()
     print(f"\n{_passed} passed, {_failed} failed")
     return 1 if _failed else 0
 
