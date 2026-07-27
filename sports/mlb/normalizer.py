@@ -156,6 +156,41 @@ def normalize_date_range_hitters(raw: dict[str, Any]) -> list[dict[str, Any]]:
     return lines
 
 
+# Pitching counting stats from the byDateRange stat type. Keyed by the MLB field
+# name (not short keys like the hitting map) so the rankable "strikeOuts" stat
+# lines up directly. inningsPitched arrives as a string ("5.1" = 5 and 1/3). The
+# win/HBP/complete-game/shutout fields feed pitcher fantasy scoring on today's
+# games; the leaderboard itself only ranks by strikeouts.
+_DATE_RANGE_PITCHING = {
+    "strikeOuts": "strikeOuts",
+    "inningsPitched": "inningsPitched",
+    "earnedRuns": "earnedRuns",
+    "baseOnBalls": "baseOnBalls",
+    "hits": "hits",
+    "wins": "wins",
+    "hitBatsmen": "hitBatsmen",
+    "completeGames": "completeGames",
+    "shutouts": "shutouts",
+}
+
+
+def normalize_date_range_pitchers(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """byDateRange pitching payload -> one pitching line per player."""
+    groups = raw.get("stats", [])
+    splits = groups[0].get("splits", []) if groups else []
+    lines: list[dict[str, Any]] = []
+    for split in splits:
+        stat = split.get("stat", {})
+        lines.append(
+            {
+                "player": split.get("player", {}).get("fullName"),
+                "team": split.get("team", {}).get("name"),
+                "stats": {k: to_number(stat.get(src, 0)) for k, src in _DATE_RANGE_PITCHING.items()},
+            }
+        )
+    return lines
+
+
 def normalize_boxscore_batters(raw: dict[str, Any]) -> list[dict[str, Any]]:
     """Box-score payload -> one batting line per player across both teams.
 

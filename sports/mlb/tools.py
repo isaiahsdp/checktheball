@@ -36,7 +36,12 @@ _STARTED_STATUSES = {"In Progress", "Manager challenge", "Final", "Game Over", "
 _GAME_HITTING_STATS = ("ab", "r", "h", "doubles", "triples", "hr", "rbi", "sb", "bb", "k")
 _RANKABLE_STATS = _GAME_HITTING_STATS + ("fantasy",)
 
-# Season stat keys (MLB naming) mapped to the keys the fantasy formula expects.
+# Today's pitchers are ranked by strikeouts only for now. A composite game-score
+# metric (K, ER, IP, ...) is deferred future work.
+_PITCHING_RANKABLE_STATS = ("strikeOuts",)
+
+# Fantasy formula keys mapped to their MLB stat-field names. The hitter and
+# pitcher formulas expect different keys, so each group has its own mapping.
 _SEASON_TO_FANTASY = {
     "h": "hits",
     "doubles": "doubles",
@@ -46,6 +51,18 @@ _SEASON_TO_FANTASY = {
     "r": "runs",
     "bb": "baseOnBalls",
     "sb": "stolenBases",
+}
+_SEASON_TO_FANTASY_PITCHING = {
+    "ip": "inningsPitched",
+    "k": "strikeOuts",
+    "w": "wins",
+    "er": "earnedRuns",
+    "h": "hits",
+    "bb": "baseOnBalls",
+    "hbp": "hitBatsmen",
+    "cg": "completeGames",
+    "cgso": "shutouts",
+    # no-hitter has no field in the season or game feeds, so "nh" stays 0.
 }
 
 # Friendly split name -> MLB sitCode.
@@ -287,13 +304,38 @@ def _season_top_performers(
     leaders = normalizer.normalize_leaders(rows)
     if not leaders:
         return {"error": f"No leaderboard data for '{stat}' in {season}."}
+    _add_gap_from_leader(leaders)
     return {"scope": "season", "stat": stat, "season": season, "limit": limit, "leaders": leaders}
 
 
+def _season_fraction_elapsed(season: int) -> float:
+    """Fraction of the regular season elapsed as of today, clamped to [0, 1].
+
+    A completed (past) season returns 1.0, so a projection over it equals the
+    actual total. Used for pitchers, whose counting stats accrue across the
+    calendar rather than in all 162 team games.
+    """
+    info = client.get_season_info(season)["seasons"][0]
+    start = datetime.strptime(info["regularSeasonStartDate"], "%Y-%m-%d")
+    end = datetime.strptime(info["regularSeasonEndDate"], "%Y-%m-%d")
+    total_days = (end - start).days
+    if total_days <= 0:
+        return 1.0
+    elapsed = (datetime.now() - start).days
+    return max(0.0, min(1.0, elapsed / total_days))
+
+
 def compute_pace_projection(
-    player: str, stat: str, season: int | None = None
+    player: str, stat: str, season: int | None = None, group: str = "hitting"
 ) -> dict[str, Any]:
-    """Project a player's current-season counting stat over a full 162 games."""
+    """Project a player's counting stat over a full season from current pace.
+
+    Hitters project a per-game-played rate across a full 162-game season.
+    Pitchers appear in far fewer than 162 games, so a per-game x162 projection
+    would overcount several-fold; instead their totals scale by the fraction of
+    the season elapsed (a completed season projects to its actual total). Not for
+    rate stats (avg, era), and not for projecting a fixed number of extra games.
+    """
     if season is None:
         season = _current_season()
     resolved = _resolve_player(player)
@@ -301,31 +343,53 @@ def compute_pace_projection(
         return {"error": f"No player found matching '{player}'."}
     player_id, full_name = resolved
 
-    raw = client.get_player_season_stats(player_id, season=season, group="hitting")
-    line = normalizer.normalize_player_stat(raw, group="hitting")
+    raw = client.get_player_season_stats(player_id, season=season, group=group)
+    line = normalizer.normalize_player_stat(raw, group=group)
 
-    if stat not in line.stats or "gamesPlayed" not in line.stats:
+    if stat not in line.stats:
         return {
-            "error": f"Can't project '{stat}' for {full_name} in {season}.",
+            "error": f"Can't project '{stat}' for {full_name} in {season} ({group}).",
             "available_stats": sorted(line.stats.keys()),
         }
-
     value = normalizer.to_number(line.stats[stat])
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return {"error": f"'{stat}' is not a countable stat to project."}
+
+    if group == "pitching":
+        fraction = _season_fraction_elapsed(season)
+        if fraction <= 0:
+            return {"error": f"Season {season} has not started yet to project from."}
+        return {
+            "player": line.player_name or full_name,
+            "stat": stat,
+            "season": season,
+            "group": group,
+            "current_value": value,
+            "season_fraction_elapsed": round(fraction, 3),
+            "projected_value": round(value / fraction, 1),
+            "method": "current_value / fraction_of_season_elapsed",
+        }
+
+    if "gamesPlayed" not in line.stats:
+        return {
+            "error": f"Can't project '{stat}' for {full_name} in {season} ({group}).",
+            "available_stats": sorted(line.stats.keys()),
+        }
     games_played = normalizer.to_number(line.stats["gamesPlayed"])
-    if not isinstance(value, (int, float)) or not isinstance(games_played, (int, float)):
+    if not isinstance(games_played, (int, float)):
         return {"error": f"'{stat}' is not a countable stat to project."}
     if games_played <= 0:
         return {"error": f"{full_name} has no games played in {season} to project from."}
 
-    projected = round(value / games_played * FULL_MLB_SEASON_GAMES, 1)
     return {
         "player": line.player_name or full_name,
         "stat": stat,
         "season": season,
+        "group": group,
         "current_value": value,
         "games_played": games_played,
         "full_season_games": FULL_MLB_SEASON_GAMES,
-        "projected_value": projected,
+        "projected_value": round(value / games_played * FULL_MLB_SEASON_GAMES, 1),
         "method": "current_value / games_played * 162",
     }
 
@@ -363,11 +427,42 @@ def _todays_hitting_lines(date: str | None) -> list[dict[str, Any]]:
     )
 
 
+def _todays_pitching_lines(date: str | None) -> list[dict[str, Any]]:
+    """Every pitcher's line for the day in one cached call. Mirrors the hitting path."""
+    day = date or datetime.now().strftime("%Y-%m-%d")
+    return db.cached_fetch(
+        "player_stats_cache",
+        f"day_pitching:{day}",
+        SPORT,
+        lambda: normalizer.normalize_date_range_pitchers(client.get_stats_by_date(day, group="pitching")),
+        _BOXSCORE_MAX_AGE_SECONDS,
+    )
+
+
 def _rank_value(stats: dict[str, Any], stat: str) -> float:
     if stat == "fantasy":
         return fantasy.hitter_points(stats)
     value = stats.get(stat)
     return value if isinstance(value, (int, float)) else 0
+
+
+def _add_gap_from_leader(leaders: list[dict[str, Any]]) -> None:
+    """Annotate each leader entry with its gap behind the top value, in place.
+
+    Precomputed so an answer citing "a 14-strikeout lead over second" grounds
+    against a real tool value instead of the model's own subtraction. The gap is
+    a magnitude, so a lower-is-better category (era, whip), where the leader
+    holds the smallest value, reads the same way as a higher-is-better one
+    instead of going negative. The leader gets 0. Skipped entirely if any value
+    is non-numeric (same guard style as _rank_value), so a leaderboard with odd
+    values is left untouched.
+    """
+    values = [entry.get("value") for entry in leaders]
+    if not values or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in values):
+        return
+    top = values[0]
+    for entry in leaders:
+        entry["gap_from_leader"] = round(abs(top - entry["value"]), 2)
 
 
 def _name_matches(query: str, full_name: str) -> bool:
@@ -406,10 +501,41 @@ def _todays_top_performers(stat: str, limit: int, date: str | None) -> dict[str,
         }
         for b in batters[: max(1, limit)]
     ]
+    _add_gap_from_leader(leaders)
     result = {"scope": "today", "date": date or "today", "stat": stat, "hitters_counted": len(batters), "leaders": leaders}
     if stat == "fantasy":
         result["scoring"] = fantasy.SCORING_SYSTEM
     return result
+
+
+def _todays_pitching_performers(stat: str, limit: int, date: str | None) -> dict[str, Any]:
+    """Rank today's pitchers by a single counting stat (strikeouts only for now).
+
+    This is a most-strikeouts ranking, not a composite "best pitching
+    performance" score. Same leaderboard shape as the hitting path.
+    """
+    if stat not in _PITCHING_RANKABLE_STATS:
+        return {
+            "error": f"Can't rank today's pitchers by '{stat}'. Only strikeouts is supported.",
+            "available_stats": list(_PITCHING_RANKABLE_STATS),
+        }
+
+    pitchers = _todays_pitching_lines(date)
+    if not pitchers:
+        return {"error": "No games have started yet for that date."}
+
+    pitchers.sort(key=lambda p: _rank_value(p["stats"], stat), reverse=True)
+    leaders = [
+        {
+            "player": p["player"],
+            "team": p["team"],
+            "value": _rank_value(p["stats"], stat),
+            "line": p["stats"],
+        }
+        for p in pitchers[: max(1, limit)]
+    ]
+    _add_gap_from_leader(leaders)
+    return {"scope": "today", "date": date or "today", "stat": stat, "group": "pitching", "pitchers_counted": len(pitchers), "leaders": leaders}
 
 
 def get_top_performers(
@@ -423,9 +549,12 @@ def get_top_performers(
     """Leaderboard of top players in a stat, for a full season or today's games.
 
     ``scope="season"`` ranks a season's league leaders; ``scope="today"`` ranks
-    batters across today's games (and supports ``stat="fantasy"``).
+    batters across today's games (and supports ``stat="fantasy"``), or today's
+    pitchers by strikeouts when ``group="pitching"``.
     """
     if scope == "today":
+        if group == "pitching":
+            return _todays_pitching_performers(stat, limit, date)
         return _todays_top_performers(stat, limit, date)
     if scope == "season":
         return _season_top_performers(stat, season, limit, group)
@@ -433,44 +562,95 @@ def get_top_performers(
 
 
 def get_fantasy_points(
-    player: str, season: int | None = None, date: str | None = None
+    player: str,
+    season: int | None = None,
+    date: str | None = None,
+    opponent: str | None = None,
+    group: str = "hitting",
 ) -> dict[str, Any]:
-    """Compute a hitter's fantasy points for today's game, or a full season.
+    """Compute a player's DraftKings fantasy points, for hitters or pitchers.
 
-    With ``season`` set, scores the season totals; otherwise scores the player's
-    line in today's game. Uses DraftKings classic hitter scoring.
+    ``group="pitching"`` scores the pitcher formula (innings, K, win, ER, etc.);
+    otherwise the hitter formula. With ``opponent`` set, scores head-to-head
+    totals vs a team (combine with ``season`` for one year, or alone for the
+    career matchup). With ``season`` set, scores season totals. Otherwise scores
+    the player's line in today's game.
     """
+    if group not in ("hitting", "pitching"):
+        return {"error": f"Fantasy points are available for 'hitting' or 'pitching', not '{group}'."}
+    pitching = group == "pitching"
+    # Pick the group's mapping, scoring formula, and label once; the three data
+    # paths below differ only in their source, not in how they score.
+    mapping = _SEASON_TO_FANTASY_PITCHING if pitching else _SEASON_TO_FANTASY
+    score = fantasy.pitcher_points if pitching else fantasy.hitter_points
+    label = fantasy.SCORING_SYSTEM_PITCHING if pitching else fantasy.SCORING_SYSTEM
+
+    if opponent is not None:
+        # Head-to-head totals vs a team, mirroring get_player_stat's opponent
+        # branch. Combinable with season (that year) or alone (career matchup),
+        # but not with the today's-game path.
+        if date is not None:
+            return {"error": "Can't combine opponent with a game date. Use opponent with an optional season for head-to-head totals."}
+        resolved = _resolve_player(player)
+        if resolved is None:
+            return {"error": f"No player found matching '{player}'."}
+        player_id, full_name = resolved
+        matched_team = _resolve_team(opponent)
+        if matched_team is None:
+            return {"error": f"No team found matching '{opponent}'."}
+        team_id, team_name = matched_team
+        totals = normalizer.normalize_total_stat(
+            client.get_player_vs_team(player_id, team_id, season, group=group)
+        )
+        if not totals:
+            where = f" in {season}" if season else ""
+            return {"error": f"No data for {full_name} vs {team_name}{where}."}
+        stats = {key: normalizer.to_number(totals.get(src, 0)) for key, src in mapping.items()}
+        return {
+            "player": full_name,
+            "scope": "vs_team",
+            "season": season,
+            "opponent": team_name,
+            "group": group,
+            "fantasy_points": score(stats),
+            "scoring": label,
+            "line": stats,
+        }
+
     if season is not None:
         resolved = _resolve_player(player)
         if resolved is None:
             return {"error": f"No player found matching '{player}'."}
         player_id, full_name = resolved
-        raw = client.get_player_season_stats(player_id, season=season, group="hitting")
-        line = normalizer.normalize_player_stat(raw, group="hitting")
-        stats = {
-            key: normalizer.to_number(line.stats.get(src, 0))
-            for key, src in _SEASON_TO_FANTASY.items()
-        }
+        raw = client.get_player_season_stats(player_id, season=season, group=group)
+        line = normalizer.normalize_player_stat(raw, group=group)
+        stats = {key: normalizer.to_number(line.stats.get(src, 0)) for key, src in mapping.items()}
         return {
             "player": line.player_name or full_name,
             "scope": "season",
             "season": line.season,
-            "fantasy_points": fantasy.hitter_points(stats),
-            "scoring": fantasy.SCORING_SYSTEM,
+            "group": group,
+            "fantasy_points": score(stats),
+            "scoring": label,
             "line": stats,
         }
 
     # No season given: score the player's line in today's game.
-    for batter in _todays_hitting_lines(date):
-        if _name_matches(player, batter["player"]):
+    lines = _todays_pitching_lines(date) if pitching else _todays_hitting_lines(date)
+    for entry in lines:
+        if _name_matches(player, entry["player"]):
+            # Pitching lines carry MLB field names; map them to the formula's keys.
+            # Hitting lines already use the hitter formula's keys directly.
+            scored = {key: entry["stats"].get(src, 0) for key, src in mapping.items()} if pitching else entry["stats"]
             return {
-                "player": batter["player"],
-                "team": batter["team"],
+                "player": entry["player"],
+                "team": entry["team"],
                 "scope": "game",
                 "date": date or "today",
-                "fantasy_points": fantasy.hitter_points(batter["stats"]),
-                "scoring": fantasy.SCORING_SYSTEM,
-                "line": batter["stats"],
+                "group": group,
+                "fantasy_points": score(scored),
+                "scoring": label,
+                "line": scored,
             }
     return {"error": f"No player matching '{player}' found in today's games. Specify a season for season totals."}
 
@@ -612,7 +792,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "'stolenBases', 'earnedRunAverage'. scope='today' ranks batters "
             "across today's games ('who is the top performer today', 'most "
             "fantasy points today'); the stat uses single-game keys like 'h', "
-            "'hr', 'rbi', or 'fantasy'."
+            "'hr', 'rbi', or 'fantasy'. With scope='today' and group='pitching' it "
+            "ranks today's pitchers by strikeouts (stat='strikeOuts'); this is a "
+            "most-strikeouts ranking only, not a composite best-performance score. "
+            "Each leader entry includes 'gap_from_leader', the precomputed size of "
+            "its gap behind the top player, always a positive number (0 for the "
+            "leader, and still positive for lower-is-better categories like "
+            "earnedRunAverage), so cite that rather than subtracting values yourself."
         ),
         "input_schema": {
             "type": "object",
@@ -628,7 +814,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "group": {
                     "type": "string",
                     "enum": ["hitting", "pitching", "fielding"],
-                    "description": "Stat group for scope='season'. Defaults to 'hitting'.",
+                    "description": "Stat group. With scope='today', 'pitching' ranks today's pitchers by strikeouts. Defaults to 'hitting'.",
                 },
                 "date": {"type": "string", "description": "YYYY-MM-DD for scope='today'. Defaults to today."},
             },
@@ -638,16 +824,26 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "compute_pace_projection",
         "description": (
-            "Project a player's current-season counting stat (home runs, hits, "
-            "RBIs, etc.) across a full 162-game season, based on games played so "
-            "far. Use for 'on pace for' questions. Not for rate stats like avg."
+            "Project a counting stat over a FULL SEASON from a player's current "
+            "pace. Hitters project across a full 162-game season (from games "
+            "played so far); pitchers scale by the fraction of the season "
+            "elapsed. Pass group='pitching' for pitching stats like 'strikeOuts' "
+            "or 'wins'. Use for 'on pace for [a full season / a milestone]' "
+            "questions. Do NOT use for rate stats (avg, era), and NOT for "
+            "projecting a specific number of ADDITIONAL games (e.g. 'over his "
+            "next 10 starts') - this tool only projects a full season."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "player": {"type": "string", "description": "Player full name."},
-                "stat": {"type": "string", "description": "A counting stat, e.g. 'homeRuns', 'hits', 'rbi'."},
+                "stat": {"type": "string", "description": "A counting stat, e.g. 'homeRuns', 'hits', 'rbi', 'strikeOuts', 'wins'."},
                 "season": {"type": "integer", "description": "Four-digit year. Defaults to the current season."},
+                "group": {
+                    "type": "string",
+                    "enum": ["hitting", "pitching"],
+                    "description": "Stat group. Use 'pitching' for pitching stats. Defaults to 'hitting'.",
+                },
             },
             "required": ["player", "stat"],
         },
@@ -655,17 +851,27 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "get_fantasy_points",
         "description": (
-            "Compute a hitter's DraftKings fantasy points, either for today's "
-            "game (default) or for a full season (pass 'season'). Use for 'how "
-            "many fantasy points does X have today' or 'X's fantasy points in "
-            "2024'. Hitters only."
+            "Compute a player's DraftKings fantasy points for today's game "
+            "(default), a full season (pass 'season'), or against one opponent "
+            "team (pass 'opponent', optionally with 'season' for a single year). "
+            "Set group='pitching' for pitcher scoring (innings, strikeouts, win, "
+            "earned runs, etc.); defaults to hitter scoring. Use for 'how many "
+            "fantasy points does X have today', 'X's fantasy points in 2024', "
+            "'X's fantasy points against the Angels in 2024', or 'how many fantasy "
+            "points did pitcher Y score in 2024'."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "player": {"type": "string", "description": "Player full name, e.g. 'Aaron Judge'."},
-                "season": {"type": "integer", "description": "Four-digit year for season totals. Omit for today's game."},
-                "date": {"type": "string", "description": "YYYY-MM-DD for the game. Defaults to today."},
+                "season": {"type": "integer", "description": "Four-digit year for season or vs-opponent totals. Omit for today's game (or the career matchup with opponent)."},
+                "date": {"type": "string", "description": "YYYY-MM-DD for the game. Defaults to today. Not combinable with opponent."},
+                "opponent": {"type": "string", "description": "Opponent team name for head-to-head fantasy totals, e.g. 'Angels'."},
+                "group": {
+                    "type": "string",
+                    "enum": ["hitting", "pitching"],
+                    "description": "Scoring group. 'pitching' uses the pitcher formula. Defaults to 'hitting'.",
+                },
             },
             "required": ["player"],
         },
