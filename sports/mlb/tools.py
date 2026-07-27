@@ -65,6 +65,17 @@ _SEASON_TO_FANTASY_PITCHING = {
     # no-hitter has no field in the season or game feeds, so "nh" stays 0.
 }
 
+# Rate stats are already normalized, so scaling one by games played or by the
+# elapsed season projects nothing. Rejected by name rather than by value: a rate
+# that lands on a whole number (an era of 0.00, an avg of .000) is
+# indistinguishable from a counting stat once it is a float.
+_RATE_STATS = frozenset({
+    "avg", "obp", "slg", "ops", "babip", "atBatsPerHomeRun",
+    "era", "whip", "strikeoutWalkRatio", "pitchesPerInning",
+})
+# Families of rate stat, for the names not spelled out above.
+_RATE_STAT_MARKERS = ("percentage", "average", "per9", "pergame", "ratio")
+
 # Friendly split name -> MLB sitCode.
 _SPLIT_CODES = {
     "home": "h",
@@ -98,6 +109,11 @@ def _cached_player_splits(
         lambda: client.get_player_splits(player_id, [code], season=season, group=group),
         _SEASON_SPLIT_MAX_AGE_SECONDS,
     )
+
+
+def _is_rate_stat(stat: str) -> bool:
+    lowered = stat.lower()
+    return stat in _RATE_STATS or any(m in lowered for m in _RATE_STAT_MARKERS)
 
 
 def _resolve_team(name: str) -> tuple[str, str] | None:
@@ -168,13 +184,18 @@ def get_player_stat(
     ``start_date``/``end_date`` window, or ``opponent`` (a team name). With no
     filter, returns the season line, or career totals when ``season`` is omitted.
     """
+    # Both ends or neither: one alone would fall through to the season line and
+    # answer a different question than the one asked, with no error.
+    if bool(start_date) != bool(end_date):
+        return {"error": "A custom window needs both start_date and end_date."}
+
     resolved = _resolve_player(player)
     if resolved is None:
         return {"error": f"No player found matching '{player}'."}
     player_id, full_name = resolved
 
     # Each filter is a distinct native MLB stat type; they are not combinable.
-    has_range = bool(date_range or (start_date and end_date))
+    has_range = bool(date_range or start_date)  # end_date paired by the guard above
     if (split is not None) + has_range + (opponent is not None) > 1:
         return {"error": "Use only one of split, date_range/start_date, or opponent at a time."}
 
@@ -338,6 +359,11 @@ def compute_pace_projection(
     """
     if season is None:
         season = _current_season()
+    if _is_rate_stat(stat):
+        return {
+            "error": f"'{stat}' is a rate, not a counting stat, so it has no pace to project.",
+            "hint": "Project a counting stat instead, e.g. homeRuns, hits, rbi, strikeOuts, wins.",
+        }
     resolved = _resolve_player(player)
     if resolved is None:
         return {"error": f"No player found matching '{player}'."}
