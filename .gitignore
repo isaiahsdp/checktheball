@@ -16,10 +16,9 @@ venv/
 *.sqlite3
 *.db
 
-# Node / frontend
+# Frontend (excluded from this backend/API repo)
+frontend/
 node_modules/
-frontend/dist/
-frontend/build/
 .vite/
 
 # OS / editor
