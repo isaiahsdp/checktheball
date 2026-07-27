@@ -115,17 +115,29 @@ QUESTIONS = [
     ("date_range", "How many home runs has Manny Machado hit in his last 10 games?", {"tool": "get_player_stat", "args": {"date_range": "last_10_games", "stat": "homeRuns"}}),
     ("date_range", "Who has more home runs over the last 30 days, Manny Machado or Jackson Merrill?", {"tool": "compare_players", "args": {"date_range": "last_30_days", "stat": "homeRuns"}}),
     ("opponent", "How does Aaron Judge hit against the Dodgers?", {"tool": "get_player_stat", "args": {"opponent": "Dodgers"}}),
-    ("opponent", "How many home runs did Aaron Judge hit against the Dodgers in 2024?", {"tool": "get_player_stat", "args": {"opponent": "Dodgers", "stat": "homeRuns"}}),
+    ("opponent", "How many home runs did Aaron Judge hit against the Dodgers in 2024?", {"tool": "get_player_stat", "args": {"opponent": "Dodgers", "stat": "homeRuns", "season": 2024}}),
     ("live", "Who is the top performer in today's games?", None),
     ("live", "Who has the most fantasy points today?", None),
+    ("live", "Who has the most strikeouts in today's games?", None),
+    # Date awareness: no explicit year, so the correct season is whatever "this
+    # season"/"current" resolves to today. expected stays None on purpose:
+    # check_tool_faithfulness only matches fixed arg values, and the right season
+    # here changes every year, so any hardcoded season would silently rot. What
+    # these probe is live behavior: does the model resolve to the real current
+    # season and query it, rather than defaulting to a training-era year or
+    # claiming the data doesn't exist yet.
+    ("date_awareness", "How many home runs does Aaron Judge have this season?", None),
+    ("date_awareness", "Who leads MLB in home runs this current season?", None),
     ("fantasy", "How many DraftKings fantasy points did Aaron Judge score in 2024?", {"tool": "get_fantasy_points", "args": {"season": 2024}}),
+    ("fantasy", "How many fantasy points has Rafael Devers scored against the Angels in 2024?", {"tool": "get_fantasy_points", "args": {"opponent": "Angels", "season": 2024}}),
     ("out_of_scope", "Who won the 2024 NBA championship?", None),
     ("out_of_scope", "What's the weather in New York today?", None),
     # Pitching (the rest of the set is hitting-only).
-    ("pitching", "How many strikeouts did Tarik Skubal have in 2024?", {"tool": "get_player_stat", "args": {"stat": "strikeOuts", "group": "pitching"}}),
+    ("pitching", "How many strikeouts did Tarik Skubal have in 2024?", {"tool": "get_player_stat", "args": {"stat": "strikeOuts", "group": "pitching","season": 2024}}),
     ("pitching", "Who had more strikeouts in 2024, Tarik Skubal or Chris Sale?", {"tool": "compare_players", "args": {"stat": "strikeOuts", "group": "pitching"}}),
     # Pitching leaderboard stat key is ambiguous; check tool + group + season.
     ("pitching", "Who led MLB in strikeouts in 2024?", {"tool": "get_top_performers", "args": {"group": "pitching", "season": 2024}}),
+    ("pitching", "How many DraftKings fantasy points did Tarik Skubal score in 2024?", {"tool": "get_fantasy_points", "args": {"group": "pitching", "season": 2024}}),
     # Ambiguous: annotated on purpose. A faithfulness miss here is the signal.
     ("ambiguous", "How many home runs did Hernandez hit in 2024?", {"tool": "get_player_stat", "args": {"stat": "homeRuns", "season": 2024}}),
     ("ambiguous", "How many home runs does Aaron Judge have?", {"tool": "get_player_stat", "args": {"stat": "homeRuns"}}),
