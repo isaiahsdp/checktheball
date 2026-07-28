@@ -74,9 +74,12 @@ def get_league_leaders(
     group: str | None = None,
 ) -> list[list[Any]]:
     """Leaderboard rows [rank, name, team, value] for a stat category."""
-    return statsapi.league_leader_data(
-        category, season=season, limit=limit, statGroup=group
-    )
+    try:
+        return statsapi.league_leader_data(
+            category, season=season, limit=limit, statGroup=group
+        )
+    except IndexError:  # wrapper indexes leagueLeaders[0]; an empty category is no rows
+        return []
 
 
 def get_player_splits(
