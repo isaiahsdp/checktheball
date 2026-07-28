@@ -122,7 +122,9 @@ def normalize_player_stat(
 
 # Box-score batting fields that describe today's game (counting stats). The
 # avg/ops in a box score are season rates, not the game, so they are left out.
-_BOX_HITTING_STATS = ("ab", "r", "h", "doubles", "triples", "hr", "rbi", "sb", "bb", "k")
+# Public because tools.py ranks today's games by these same keys: one definition
+# here, so the producing and consuming sides cannot drift apart.
+BOX_HITTING_STATS = ("ab", "r", "h", "doubles", "triples", "hr", "rbi", "sb", "bb", "k")
 
 # Our batting-line keys mapped to the MLB byDateRange stat names.
 _DATE_RANGE_HITTING = {
@@ -214,7 +216,7 @@ def normalize_boxscore_batters(raw: dict[str, Any]) -> list[dict[str, Any]]:
                     "player": full_name or batter.get("name"),
                     "team": team,
                     "position": batter.get("position"),
-                    "stats": {k: to_number(batter.get(k)) for k in _BOX_HITTING_STATS},
+                    "stats": {k: to_number(batter.get(k)) for k in BOX_HITTING_STATS},
                 }
             )
     return lines

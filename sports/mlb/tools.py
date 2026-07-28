@@ -32,13 +32,20 @@ _SEASON_SPLIT_MAX_AGE_SECONDS = 900
 _STARTED_STATUSES = {"In Progress", "Manager challenge", "Final", "Game Over", "Completed Early"}
 
 # Today's-game counting stats that make sense to rank live performers by, plus
-# "fantasy" for a computed fantasy-point ranking.
-_GAME_HITTING_STATS = ("ab", "r", "h", "doubles", "triples", "hr", "rbi", "sb", "bb", "k")
+# "fantasy" for a computed fantasy-point ranking. Aliased from the normalizer
+# rather than redeclared: it produces these keys, this ranks by them.
+_GAME_HITTING_STATS = normalizer.BOX_HITTING_STATS
 _RANKABLE_STATS = _GAME_HITTING_STATS + ("fantasy",)
 
 # Today's pitchers are ranked by strikeouts only for now. A composite game-score
 # metric (K, ER, IP, ...) is deferred future work.
 _PITCHING_RANKABLE_STATS = ("strikeOuts",)
+
+# Stat groups each tool accepts. Season leaderboards pass all three through to
+# the MLB leader API; everything else has a per-group formula or method that
+# exists for hitters and pitchers only.
+_STAT_GROUPS = ("hitting", "pitching", "fielding")
+_HITTING_PITCHING = ("hitting", "pitching")
 
 # Fantasy formula keys mapped to their MLB stat-field names. The hitter and
 # pitcher formulas expect different keys, so each group has its own mapping.
@@ -357,6 +364,8 @@ def compute_pace_projection(
     the season elapsed (a completed season projects to its actual total). Not for
     rate stats (avg, era), and not for projecting a fixed number of extra games.
     """
+    if group not in _HITTING_PITCHING:
+        return {"error": f"Pace projection is available for 'hitting' or 'pitching', not '{group}'."}
     if season is None:
         season = _current_season()
     if _is_rate_stat(stat):
@@ -578,7 +587,13 @@ def get_top_performers(
     batters across today's games (and supports ``stat="fantasy"``), or today's
     pitchers by strikeouts when ``group="pitching"``.
     """
+    if group not in _STAT_GROUPS:
+        return {"error": f"Leaderboards are available for 'hitting', 'pitching', or 'fielding', not '{group}'."}
     if scope == "today":
+        # Only hitting and pitching have a today's-games path; fielding would
+        # otherwise fall through and silently return a hitting leaderboard.
+        if group not in _HITTING_PITCHING:
+            return {"error": f"Today's leaderboards are available for 'hitting' or 'pitching', not '{group}'."}
         if group == "pitching":
             return _todays_pitching_performers(stat, limit, date)
         return _todays_top_performers(stat, limit, date)
@@ -602,7 +617,7 @@ def get_fantasy_points(
     career matchup). With ``season`` set, scores season totals. Otherwise scores
     the player's line in today's game.
     """
-    if group not in ("hitting", "pitching"):
+    if group not in _HITTING_PITCHING:
         return {"error": f"Fantasy points are available for 'hitting' or 'pitching', not '{group}'."}
     pitching = group == "pitching"
     # Pick the group's mapping, scoring formula, and label once; the three data
