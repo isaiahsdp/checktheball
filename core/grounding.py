@@ -69,6 +69,7 @@ def extract_claims(answer: str, client: anthropic.Anthropic) -> list[dict[str, A
     response = client.messages.create(
         model=GROUNDING_MODEL,
         max_tokens=MAX_TOKENS,
+        temperature=0,  # same answer should yield the same claim set run to run
         system=_EXTRACTION_SYSTEM,
         messages=[{"role": "user", "content": f"Answer:\n{answer}"}],
         output_config={"format": {"type": "json_schema", "schema": _CLAIMS_SCHEMA}},
