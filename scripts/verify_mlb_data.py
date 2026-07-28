@@ -179,6 +179,14 @@ def offline_checks() -> None:
     tools._add_gap_from_leader(odd_board)
     check("gap_from_leader: non-numeric leaderboard left untouched", all("gap_from_leader" not in e for e in odd_board))
 
+    # One source of truth for the box-score batting keys: the normalizer produces
+    # them, tools ranks by them. Identity rather than equality, so reintroducing a
+    # second literal is caught even while its values still happen to match.
+    check(
+        "batting keys: tools reuses the normalizer's tuple, not a second copy",
+        tools._GAME_HITTING_STATS is getattr(normalizer, "BOX_HITTING_STATS", None),
+    )
+
     # The rate-stat classifier must catch both the named stats and the families
     # (percentage / average / per9 / ...) without swallowing counting stats.
     rates = ("avg", "obp", "ops", "era", "whip", "battingAverage", "stolenBasePercentage", "strikeoutsPer9Inn")
@@ -331,6 +339,29 @@ def tool_checks() -> None:
     finally:
         tools._season_fraction_elapsed = real_fraction
     check("season fraction of a completed season is 1.0", tools._season_fraction_elapsed(2024) == 1.0)
+
+    # group is validated the same way in every tool that takes one: an unknown
+    # value errors immediately instead of silently defaulting to hitting (today's
+    # leaderboard), raising out of the wrapper (season leaderboard), or failing
+    # downstream with a stat list for the wrong group (pace projection).
+    bad_today = tools.get_top_performers("h", scope="today", group="fielding", limit=2)
+    check("group guard: today's leaderboard rejects an unsupported group", "error" in bad_today and "leaders" not in bad_today)
+    bad_typo = tools.get_top_performers("h", scope="today", group="hittting", limit=2)
+    check("group guard: today's leaderboard rejects a misspelled group", "error" in bad_typo and "leaders" not in bad_typo)
+    bad_season = tools.get_top_performers("homeRuns", scope="season", season=2024, group="nonsense", limit=2)
+    check("group guard: season leaderboard rejects an unknown group instead of raising", "error" in bad_season and "leaders" not in bad_season)
+    bad_pace = tools.compute_pace_projection("Aaron Judge", "homeRuns", season=2024, group="fielding")
+    check("group guard: pace projection names the bad group, not a stat list", "not 'fielding'" in bad_pace.get("error", "") and "available_stats" not in bad_pace)
+    bad_fantasy = tools.get_fantasy_points("Aaron Judge", season=2024, group="fielding")
+    check("group guard: fantasy points rejects an unsupported group", "not 'fielding'" in bad_fantasy.get("error", "") and "fantasy_points" not in bad_fantasy)
+    # A category with no leaders must come back as a clean error, not raise out of
+    # the statsapi wrapper, which indexes leagueLeaders[0] unguarded.
+    empty_lb = tools.get_top_performers("notAStat", scope="season", season=2024, limit=3)
+    check("leaderboard: an empty stat category errors cleanly instead of raising", "error" in empty_lb and "leaders" not in empty_lb)
+
+    # fielding is a real season leaderboard group, so the whitelist must keep it.
+    fielding_lb = tools.get_top_performers("assists", scope="season", season=2024, limit=3, group="fielding")
+    check("group guard: fielding season leaderboard still works", fielding_lb.get("leaders", [{}])[0].get("player") == "Ezequiel Tovar")
 
     split = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, split="home")
     check("get_player_stat split: Judge home HR == 31", split.get("value") == 31 and split.get("split") == "home")
