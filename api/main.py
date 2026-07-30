@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -26,6 +27,11 @@ logger = logging.getLogger(__name__)
 
 # The schedule changes as games start and scores move, so keep the cache short.
 LIVE_GAMES_MAX_AGE_SECONDS = 30
+
+# Opt-in fallback for an empty day, and how far back it will look before giving
+# up. Bounded so an off-season request can't walk backwards indefinitely.
+_FALLBACK_LAST_PLAYED = "last_played"
+MAX_FALLBACK_DAYS = 10
 
 # Cap question length: long enough for any real sports question, short enough to
 # reject a huge pasted block meant to burn tokens on a call that would fail anyway.
@@ -55,22 +61,51 @@ def health() -> dict:
     return {"status": "ok", "service": "checktheball"}
 
 
-@app.get("/games/live")
-def games_live(date: str | None = None) -> dict:
-    """Today's MLB games (or a given ``date=YYYY-MM-DD``), normalized.
-
-    Results are cached briefly so repeated polling doesn't hammer the feed.
-    """
-    key = f"schedule:{date or 'today'}"
+def _load_games(date: str | None) -> list[dict[str, Any]]:
+    """Normalized schedule for one day, served from the short-lived cache."""
 
     def fetch() -> list[dict[str, Any]]:
         raw = client.get_schedule(date=date)
         return [normalizer.normalize_game(g).to_dict() for g in raw]
 
-    try:
-        games = db.cached_fetch(
-            "games", key, normalizer.SPORT, fetch, LIVE_GAMES_MAX_AGE_SECONDS
+    return db.cached_fetch(
+        "games", f"schedule:{date or 'today'}", normalizer.SPORT, fetch, LIVE_GAMES_MAX_AGE_SECONDS
+    )
+
+
+def _last_played(date: str | None) -> tuple[list[dict[str, Any]], str | None]:
+    """Walk back day by day to the most recent day with games, bounded.
+
+    Returns (games, day_used) or ([], None) if nothing is found within the cap,
+    so an off-season request terminates instead of walking indefinitely.
+    """
+    start = datetime.strptime(date, "%Y-%m-%d") if date else datetime.now()
+    for back in range(1, MAX_FALLBACK_DAYS + 1):
+        day = (start - timedelta(days=back)).strftime("%Y-%m-%d")
+        games = _load_games(day)
+        if games:
+            return games, day
+    return [], None
+
+
+@app.get("/games/live")
+def games_live(date: str | None = None, fallback: str | None = None) -> dict:
+    """Today's MLB games (or a given ``date=YYYY-MM-DD``), normalized.
+
+    Results are cached briefly so repeated polling doesn't hammer the feed. With
+    ``fallback=last_played``, an empty day returns the most recent day that had
+    games instead, and ``fell_back_to`` names the day actually returned.
+    """
+    if fallback is not None and fallback != _FALLBACK_LAST_PLAYED:
+        raise HTTPException(
+            status_code=400, detail=f"Unknown fallback '{fallback}'. Use '{_FALLBACK_LAST_PLAYED}'."
         )
+
+    try:
+        games = _load_games(date)
+        fell_back_to = None
+        if not games and fallback == _FALLBACK_LAST_PLAYED:
+            games, fell_back_to = _last_played(date)
     except Exception:
         # Log the real detail server-side; don't leak internals to the client.
         logger.exception("Schedule lookup failed")
@@ -79,10 +114,35 @@ def games_live(date: str | None = None) -> dict:
     live = [g for g in games if g["state"] == "live"]
     return {
         "date": date,
+        "fell_back_to": fell_back_to,
         "count": len(games),
         "live_count": len(live),
         "games": games,
     }
+
+
+@app.get("/games/{game_id}/boxscore")
+def game_boxscore(game_id: str, date: str | None = None) -> dict:
+    """Batting lines for one game, keyed by the game_id ``/games/live`` returns.
+
+    Batters only, both teams in one array, best fantasy line first. Keyed by id
+    rather than team names so each half of a doubleheader is reachable. Not
+    rate-limited: it is a cached read and makes no model call.
+    """
+    try:
+        box = mlb_tools.get_game_boxscore_by_id(game_id, date=date)
+    except Exception:
+        # Log the real detail server-side; don't leak internals to the client.
+        logger.exception("Box score lookup failed")
+        raise HTTPException(status_code=502, detail="Could not load that box score right now.")
+
+    if "error" in box:
+        # Only the not-yet-started case carries the schedule status; a missing id
+        # has nothing to report but the id itself.
+        if "status" in box:
+            raise HTTPException(status_code=409, detail=f"{box['error']} Status: {box['status']}.")
+        raise HTTPException(status_code=404, detail=box["error"])
+    return box
 
 
 class AskRequest(BaseModel):
