@@ -25,7 +25,6 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-from datetime import datetime
 
 # Make the project importable when run as a plain script.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -93,6 +92,19 @@ def offline_checks() -> None:
     check("fantasy points on Judge 2024 line == 1871", fantasy.hitter_points(judge) == 1871)
     check("fantasy points on empty line == 0", fantasy.hitter_points({}) == 0)
 
+    # A today's pitching line must be scored with the PITCHER formula. Scoring it
+    # with the hitter formula matches none of these keys and silently returns 0,
+    # which is why _rank_value takes the group instead of guessing it.
+    # 7.0 IP, 9 K, 3 ER, 3 H, 0 BB, 1 HBP, no win:
+    #   7*2.25 + 9*2 - 3*2 - 3*0.6 - 1*0.6 = 15.75 + 18 - 6 - 1.8 - 0.6 = 25.35
+    day_line = {"strikeOuts": 9, "inningsPitched": 7.0, "earnedRuns": 3, "baseOnBalls": 0,
+                "hits": 3, "wins": 0, "hitBatsmen": 1, "completeGames": 0, "shutouts": 0}
+    check("rank_value: pitching fantasy uses the pitcher formula == 25.35", tools._rank_value(day_line, "fantasy", "pitching") == 25.35)
+    check("rank_value: the same line under the hitter formula scores 0 (the trap)", tools._rank_value(day_line, "fantasy") == 0)
+    check("rank_value: a plain counting stat is unaffected by group", tools._rank_value(day_line, "strikeOuts", "pitching") == 9)
+    # The win bonus is available here but not from a box score, so it must apply.
+    check("rank_value: pitching fantasy counts the win (+4)", tools._rank_value({**day_line, "wins": 1}, "fantasy", "pitching") == 29.35)
+
     # Pitcher fantasy: hand-computed DraftKings classic lines.
     # 6.2 IP (= 6 2/3): 6.667*2.25 + 7*2 - 3*2 - 6*0.6 - 2*0.6 - 1*0.6
     #                 = 15.0 + 14 - 6 - 3.6 - 1.2 - 0.6 = 17.6
@@ -113,18 +125,59 @@ def offline_checks() -> None:
         "playerInfo": {"ID123": {"fullName": "Full Name"}},
         "awayBatters": [
             {"personId": 0, "name": "Twins Batters", "ab": "AB"},  # header row
-            {"personId": 123, "name": "Name", "ab": "4", "h": "2", "doubles": "1",
+            {"personId": 123, "name": "Name", "position": "CF", "battingOrder": "400",
+             "substitution": False, "ab": "4", "h": "2", "doubles": "1",
              "triples": "0", "hr": "1", "rbi": "3", "r": "1", "bb": "1", "sb": "0",
              "k": "2", "avg": ".300", "ops": ".900"},
+            {"personId": 124, "name": "Sub", "position": "CF", "battingOrder": "401",
+             "substitution": True, "ab": "1", "h": "0", "doubles": "0", "triples": "0",
+             "hr": "0", "rbi": "0", "r": "0", "bb": "0", "sb": "0", "k": "1"},
         ],
         "homeBatters": [],
     }
     batters = normalizer.normalize_boxscore_batters(box)
-    check("box normalizer: header row skipped", len(batters) == 1)
+    check("box normalizer: header row skipped", len(batters) == 2)
     check("box normalizer: full name from playerInfo", batters[0]["player"] == "Full Name")
-    check("box normalizer: team assembled", batters[0]["team"] == "Minnesota Twins")
+    # No team label here on purpose: the box score's own team fields are display
+    # abbreviations that double up, so the caller labels rows from the side.
+    check("box normalizer: carries side, not a concatenated team label",
+          batters[0].get("side") == "away" and "team" not in batters[0])
+    check("box normalizer: batting order keeps slot and substitution suffix",
+          batters[0].get("batting_order") == 400 and batters[1].get("batting_order") == 401)
+    check("box normalizer: substitution flag passed through",
+          batters[0].get("substitution") is False and batters[1].get("substitution") is True)
+    check("box normalizer: blank batting order -> None",
+          normalizer.normalize_boxscore_batters({"awayBatters": [{"personId": 5, "battingOrder": ""}], "homeBatters": []})[0]["batting_order"] is None)
     check("box normalizer: stats coerced to numbers", batters[0]["stats"]["hr"] == 1 and batters[0]["stats"]["h"] == 2)
     check("box normalizer: season rates excluded", "avg" not in batters[0]["stats"] and "ops" not in batters[0]["stats"])
+
+    # Box-score pitching normalizer: header row skipped, full name preferred,
+    # season era excluded (same reason avg/ops are), decision parsed from note.
+    pitch_box = {
+        "teamInfo": {
+            "away": {"shortName": "Chi", "teamName": "Cubs"},
+            "home": {"shortName": "Baltimore", "teamName": "Orioles"},
+        },
+        "playerInfo": {"ID77": {"fullName": "Full Pitcher"}},
+        "awayPitchers": [
+            {"personId": 0, "name": "Cubs Pitchers", "ip": "IP", "era": "ERA"},  # header row
+            {"personId": 77, "name": "Pitcher", "note": "(W, 5-2)", "ip": "6.0", "h": "4",
+             "r": "2", "er": "2", "bb": "1", "k": "7", "hr": "1", "p": "88", "s": "64", "era": "3.21"},
+            {"personId": 78, "name": "Reliever", "note": "", "ip": "0.2", "h": "1",
+             "r": "0", "er": "0", "bb": "0", "k": "1", "hr": "0", "p": "12", "s": "8", "era": "2.00"},
+        ],
+        "homePitchers": [],
+    }
+    arms = normalizer.normalize_boxscore_pitchers(pitch_box)
+    check("box pitching normalizer: header row skipped", len(arms) == 2)
+    check("box pitching normalizer: full name from playerInfo", arms[0]["player"] == "Full Pitcher")
+    check("box pitching normalizer: carries side, not a concatenated team label",
+          arms[0].get("side") == "away" and "team" not in arms[0])
+    check("box pitching normalizer: season era excluded", "era" not in arms[0]["stats"])
+    check("box pitching normalizer: p/s renamed, values coerced", arms[0]["stats"].get("pitches") == 88 and arms[0]["stats"].get("strikes") == 64)
+    check("box pitching normalizer: decision parsed from note", arms[0]["decision"] == "W" and arms[1]["decision"] is None)
+    check("box pitching normalizer: MLB innings notation preserved", arms[1]["stats"].get("ip") == 0.2)
+    check("box pitching normalizer: empty payload -> []", normalizer.normalize_boxscore_pitchers({}) == [])
 
     # Date-range normalizer: maps MLB stat names to our keys.
     date_range = {"stats": [{"splits": [
@@ -219,6 +272,17 @@ def live_checks() -> None:
     )
     check("Judge 2024 home runs == 58", season.stats.get("homeRuns") == 58)
     check("season scope and year set", season.scope == "season" and season.season == 2024)
+
+    # 3b. Box-score pitching lines, anchored on the same completed 2024 game.
+    # Taillon went 6 IP, 4 H, 2 ER, 1 BB, 7 K and took the win, so his line and
+    # its DraftKings score are fixed: 13.5 (IP) + 14 (K) + 4 (W) - 4 (ER)
+    # - 2.4 (H) - 0.6 (BB) = 24.5. Home runs carry no separate pitcher penalty.
+    arms_2024 = normalizer.normalize_boxscore_pitchers(client.get_game_boxscore(747014))
+    winner = next((p for p in arms_2024 if p["decision"] == "W"), None)
+    check("2024 box score: winning pitcher identified from the note", winner is not None and winner["player"] == "Jameson Taillon")
+    if winner:
+        check("2024 box score: pitching line matches", winner["stats"]["ip"] == 6.0 and winner["stats"]["k"] == 7 and winner["stats"]["er"] == 2)
+        check("2024 box score: win bonus applied to the pitcher's score", tools._pitcher_line_points(winner) == 24.5)
 
     # 4. Career stats -> PlayerStat.
     career = normalizer.normalize_player_stat(
@@ -529,6 +593,20 @@ def live_feature_checks() -> None:
     bad_pitch = tools.get_top_performers("era", scope="today", group="pitching")
     check("today pitching leaderboard: unsupported stat rejected cleanly", "error" in bad_pitch and "available_stats" in bad_pitch)
 
+    # Today's pitchers can be ranked by computed fantasy points, the counterpart
+    # of the hitting path's stat="fantasy".
+    fantasy_pitch = tools.get_top_performers("fantasy", scope="today", group="pitching", limit=3)
+    if "error" in fantasy_pitch:
+        check("today pitching fantasy: clean no-games message", "no games" in fantasy_pitch["error"].lower())
+    else:
+        check("today pitching fantasy: labels the pitcher scoring system", fantasy_pitch.get("scoring") == "DraftKings classic (pitching)")
+        values = [l["value"] for l in fantasy_pitch["leaders"]]
+        check("today pitching fantasy: ranked by score, descending", values == sorted(values, reverse=True))
+        check(
+            "today pitching fantasy: value is the pitcher score, not a zeroed hitter score",
+            any(v != 0 for v in values) and all(l["value"] == l["fantasy_points"] for l in fantasy_pitch["leaders"]),
+        )
+
     started = [g for g in tools._cached_schedule(None) if g.get("status") in tools._STARTED_STATUSES]
     if started:
         game = started[0]
@@ -538,6 +616,65 @@ def live_feature_checks() -> None:
             "batters" in box and (not box["batters"] or "fantasy_points" in box["batters"][0]),
         )
     check("game boxscore unknown matchup -> error", "error" in tools.get_game_boxscore("Lakers", "Celtics"))
+
+    # The by-id lookup backs the API's box-score endpoint. Same shape as the
+    # team-name path, and it can address a game the team-name path cannot.
+    schedule = tools._cached_schedule(None)
+    started_games = [g for g in schedule if g.get("status") in tools._STARTED_STATUSES]
+    if started_games:
+        # Prefer a club whose raw box-score label disagrees with its schedule name
+        # ("NY Mets Mets", "Arizona D-backs"). A game where the two happen to
+        # coincide cannot catch the labelling bug, so it is the wrong test subject.
+        mislabelled = ("Mets", "Yankees", "Cubs", "White Sox", "Diamondbacks", "Angels", "Athletics")
+        game = next(
+            (g for g in started_games if any(c in f"{g['away_name']} {g['home_name']}" for c in mislabelled)),
+            started_games[0],
+        )
+        by_id = tools.get_game_boxscore_by_id(game["game_id"])
+        check(
+            "game boxscore by id: resolves to that game with batting lines",
+            by_id.get("away_team") == game.get("away_name")
+            and by_id.get("home_team") == game.get("home_name")
+            and (not by_id["batters"] or "fantasy_points" in by_id["batters"][0]),
+        )
+        points = [b["fantasy_points"] for b in by_id["batters"]]
+        check("game boxscore by id: batters sorted best fantasy line first", points == sorted(points, reverse=True))
+        check(
+            "game boxscore by id: pitching lines alongside the batting lines",
+            "pitchers" in by_id
+            and (not by_id["pitchers"] or {"player", "team", "side", "decision", "stats", "fantasy_points"} <= set(by_id["pitchers"][0])),
+        )
+        # Every row's team must equal one of the two top-level names exactly, so a
+        # client can split the box score by side with an equality check. The raw
+        # feed's own labels don't ("NY Mets Mets", "Arizona D-backs").
+        labels = {row["team"] for row in by_id["batters"] + by_id["pitchers"]}
+        check(
+            "game boxscore by id: every row's team matches away_team or home_team exactly",
+            labels and labels <= {by_id["away_team"], by_id["home_team"]},
+        )
+        check(
+            "game boxscore by id: batters carry batting order and the substitution flag",
+            all(isinstance(b.get("substitution"), bool) and (b.get("batting_order") is None or isinstance(b["batting_order"], int)) for b in by_id["batters"]),
+        )
+        starters = [b for b in by_id["batters"] if not b["substitution"] and b["batting_order"] is not None]
+        check(
+            "game boxscore by id: starters occupy whole-hundred slots, subs do not",
+            all(b["batting_order"] % 100 == 0 for b in starters),
+        )
+    check("game boxscore by id: unknown id -> error", "error" in tools.get_game_boxscore_by_id(0))
+    # A doubleheader is exactly what team names cannot disambiguate: only the
+    # first match is reachable that way, so each id must resolve to its own game.
+    pairs = [(g.get("away_name"), g.get("home_name")) for g in schedule]
+    doubleheader = [g for g in schedule if pairs.count((g.get("away_name"), g.get("home_name"))) > 1]
+    started_dh = [g for g in doubleheader if g.get("status") in tools._STARTED_STATUSES]
+    if len(started_dh) > 1:
+        check(
+            "game boxscore by id: each half of a doubleheader resolves to its own game",
+            all(
+                tools.get_game_boxscore_by_id(g["game_id"]).get("home_score") == g.get("home_score")
+                for g in started_dh
+            ),
+        )
 
 
 def main() -> int:

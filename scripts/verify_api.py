@@ -32,6 +32,7 @@ from fastapi.testclient import TestClient
 import api.main as main
 from core import db, grounding, orchestrator
 from sports.mlb import client
+from sports.mlb import tools as mlb_tools
 
 _passed = 0
 _failed = 0
@@ -101,6 +102,57 @@ def _schedule_ok(date=None):
 
 def _schedule_boom(date=None):
     raise RuntimeError("schedule down")
+
+
+def _schedule_empty(date=None):
+    return []
+
+
+def _schedule_only_on(target: str):
+    """Schedule that has games on exactly one date, for the fallback walk."""
+
+    def fetch(date=None):
+        return _schedule_ok() if date == target else []
+
+    return fetch
+
+
+_BOXSCORE = {
+    "date": "today",
+    "away_team": "Texas Rangers",
+    "home_team": "Tampa Bay Rays",
+    "status": "In Progress",
+    "away_score": 0,
+    "home_score": 3,
+    "scoring": "DraftKings classic",
+    "batters": [
+        {"player": "Ryan Vilade", "team": "Tampa Bay Rays", "side": "home", "position": "RF",
+         "batting_order": 900, "substitution": False,
+         "stats": {"ab": 2, "r": 1, "h": 1, "doubles": 0, "triples": 0, "hr": 1, "rbi": 2, "sb": 0, "bb": 0, "k": 0},
+         "fantasy_points": 16},
+    ],
+    "pitchers": [
+        {"player": "Logan Webb", "team": "San Francisco Giants", "side": "away", "decision": "W",
+         "stats": {"ip": 6.0, "h": 5, "r": 2, "er": 2, "bb": 1, "k": 4, "hr": 0, "pitches": 96, "strikes": 61},
+         "fantasy_points": 17.9},
+    ],
+}
+
+
+def _boxscore_ok(game_id, date=None):
+    return _BOXSCORE
+
+
+def _boxscore_missing(game_id, date=None):
+    return {"error": f"No game found with id '{game_id}' for that date."}
+
+
+def _boxscore_not_started(game_id, date=None):
+    return {"error": "The Boston Red Sox at Athletics game hasn't started yet.", "status": "Pre-Game"}
+
+
+def _boxscore_boom(game_id, date=None):
+    raise RuntimeError("boxscore down")
 
 
 # --- Temp-DB helpers -------------------------------------------------------
@@ -223,6 +275,90 @@ def games_live_fetch_raises() -> None:
     check("games fetch raises: response does not leak the exception", "schedule down" not in r.text)
 
 
+def games_live_fallback() -> None:
+    # An empty day returns nothing by default, and fell_back_to is null so the
+    # client can tell a real day from a substituted one.
+    client.get_schedule = _schedule_empty
+    with TestClient(main.app) as tc:
+        plain = tc.get("/games/live", params={"date": "2026-01-15"}).json()
+    check("fallback absent: empty day stays empty", plain["count"] == 0 and plain["games"] == [])
+    check("fallback absent: fell_back_to is null", plain["fell_back_to"] is None)
+
+    # With the fallback, the walk finds the one day that has games and names it.
+    client.get_schedule = _schedule_only_on("2026-01-12")
+    with TestClient(main.app) as tc:
+        fell = tc.get("/games/live", params={"date": "2026-01-15", "fallback": "last_played"}).json()
+    check("fallback: walks back to the most recent day with games", fell["count"] == 4)
+    check("fallback: fell_back_to names the day used", fell["fell_back_to"] == "2026-01-12")
+    check("fallback: response keeps its existing shape", {"date", "count", "live_count", "games"} <= set(fell))
+
+    # A non-empty day must not walk at all, even with the fallback set.
+    client.get_schedule = _schedule_ok
+    with TestClient(main.app) as tc:
+        direct = tc.get("/games/live", params={"date": "2026-02-01", "fallback": "last_played"}).json()
+    check("fallback: a day that has games does not fall back", direct["count"] == 4 and direct["fell_back_to"] is None)
+
+    # Beyond the cap the walk gives up rather than running away. Uses a date
+    # window no earlier check touched: the schedule cache is shared across checks,
+    # so a day another fake already populated would be served from cache here.
+    client.get_schedule = _schedule_empty
+    with TestClient(main.app) as tc:
+        gave_up = tc.get("/games/live", params={"date": "2026-05-20", "fallback": "last_played"}).json()
+    check("fallback: gives up past the day cap", gave_up["count"] == 0 and gave_up["fell_back_to"] is None)
+
+    # An unknown value is rejected rather than silently ignored.
+    with TestClient(main.app) as tc:
+        bad = tc.get("/games/live", params={"fallback": "yesterday"})
+    check("fallback: unknown value -> 400", bad.status_code == 400)
+
+
+def boxscore_endpoint() -> None:
+    main_boxscore = mlb_tools.get_game_boxscore_by_id
+    try:
+        mlb_tools.get_game_boxscore_by_id = _boxscore_ok
+        with TestClient(main.app) as tc:
+            r = tc.get("/games/822947/boxscore")
+        check("boxscore: 200", r.status_code == 200)
+        body = r.json()
+        check("boxscore: teams, status, and scores present", body["away_team"] == "Texas Rangers" and body["status"] == "In Progress" and body["home_score"] == 3)
+        check("boxscore: batters carry team, side, position, order, stats, fantasy_points",
+              {"player", "team", "side", "position", "batting_order", "substitution", "stats", "fantasy_points"} <= set(body["batters"][0]))
+        check("boxscore: short box-score stat keys, not MLB camelCase",
+              {"ab", "r", "h", "doubles", "triples", "hr", "rbi", "sb", "bb", "k"} == set(body["batters"][0]["stats"]))
+        arm = body["pitchers"][0]
+        check("boxscore: pitchers array present alongside batters",
+              {"player", "team", "decision", "stats", "fantasy_points"} <= set(arm))
+        check("boxscore: pitching stats carry innings and the W/L/S decision",
+              arm["stats"]["ip"] == 6.0 and arm["decision"] == "W" and "era" not in arm["stats"])
+
+        mlb_tools.get_game_boxscore_by_id = _boxscore_missing
+        with TestClient(main.app) as tc:
+            missing = tc.get("/games/999999/boxscore")
+        check("boxscore: unknown game_id -> 404", missing.status_code == 404)
+
+        mlb_tools.get_game_boxscore_by_id = _boxscore_not_started
+        with TestClient(main.app) as tc:
+            early = tc.get("/games/824973/boxscore")
+        check("boxscore: not-yet-started -> 409", early.status_code == 409)
+        check("boxscore: 409 detail carries the schedule status", "Pre-Game" in early.json()["detail"])
+
+        mlb_tools.get_game_boxscore_by_id = _boxscore_boom
+        with TestClient(main.app) as tc:
+            broken = tc.get("/games/822947/boxscore")
+        check("boxscore: upstream failure -> 502", broken.status_code == 502)
+        check("boxscore: 502 does not leak the exception", "boxscore down" not in broken.text)
+
+        # Not on the /ask limiter: a cached read must not burn the model budget.
+        main.limiter.reset()
+        mlb_tools.get_game_boxscore_by_id = _boxscore_ok
+        with TestClient(main.app) as tc:
+            codes = [tc.get("/games/822947/boxscore").status_code for _ in range(main.ASK_RATE_LIMIT_PER_MINUTE + 3)]
+        check("boxscore: not rate-limited like /ask", all(c == 200 for c in codes))
+        main.limiter.reset()
+    finally:
+        mlb_tools.get_game_boxscore_by_id = main_boxscore
+
+
 def ask_rate_limit() -> None:
     # The per-IP /ask limit shares in-memory state across requests, so reset it
     # to isolate this test from the other /ask checks, then fire more than the
@@ -270,6 +406,8 @@ def main_() -> int:
         ask_daily_limit_registered()
         games_live_happy_path()
         games_live_fetch_raises()
+        games_live_fallback()
+        boxscore_endpoint()
     finally:
         orchestrator.answer_question = _ORIGINALS["answer_question"]
         grounding.ground_answer = _ORIGINALS["ground_answer"]
