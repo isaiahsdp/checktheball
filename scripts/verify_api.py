@@ -133,6 +133,14 @@ def ask_happy_path() -> None:
     check("ask happy: grounding_score present", body.get("grounding_score") == 1.0)
     check("ask happy: grounding.claims present", len(body["grounding"]["claims"]) == 1)
     check("ask happy: tool_calls present", body["tool_calls"][0]["name"] == "get_player_stat")
+    # The client needs the retrieved values, not just which tool ran. The fake's
+    # tool_calls_made carries no result, so sourcing from it again fails here.
+    call = body["tool_calls"][0]
+    check(
+        "ask happy: tool_calls carry their result data",
+        "result" in call and call["result"] and call["result"]["value"] == 58,
+    )
+    check("ask happy: tool_calls still carry name and input", "input" in call and call["name"] == "get_player_stat")
     check("ask happy: one row logged", _queries_count() == before + 1)
     row = _last_query()
     check(

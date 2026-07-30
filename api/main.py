@@ -128,5 +128,7 @@ def ask(request: Request, req: AskRequest) -> dict:
             "total_claims": graded["total_claims"],
             "claims": graded["claims"],
         },
-        "tool_calls": answered["tool_calls_made"],
+        # tool_results carries the same calls as tool_calls_made plus each one's
+        # returned data, which a client needs to render the underlying numbers.
+        "tool_calls": answered["tool_results"],
     }
