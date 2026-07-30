@@ -40,8 +40,9 @@ something subtly wrong.
 ## What it can answer
 
 Player stats (season, career, or filtered by home/away, a date range, or an
-opponent), player comparisons, leaderboards, season pace projections, and
-DraftKings-style fantasy scoring for hitters and pitchers.
+opponent), player comparisons, leaderboards, season pace projections, box
+scores, who's performing best in today's games, and DraftKings-style fantasy
+scoring for hitters and pitchers.
 
 ## Layout
 
@@ -55,8 +56,14 @@ DraftKings-style fantasy scoring for hitters and pitchers.
 the data it was checked against. Rate-limited per IP, since each call makes
 a real, paid model request.
 
-**`GET /games/live`**: today's games and scores. No model call, no key
-needed.
+**`GET /games/live`**: today's games and scores. Pass
+`?fallback=last_played` and an empty day returns the most recent day that had
+games instead, so a scoreboard doesn't have to hide itself in the off-season.
+No model call, no key needed.
+
+**`GET /games/{game_id}/boxscore`**: every batter's and pitcher's line for one
+game. Keyed by game id rather than team names, so both halves of a
+doubleheader are reachable. No model call, no key needed.
 
 ## Stack
 

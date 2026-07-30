@@ -33,8 +33,8 @@ tests trustworthy.
 |---|---|---|---|
 | `scripts/verify_orchestrator.py` | 29 | none | the tool-use loop |
 | `scripts/verify_grounding.py` | 28 | none | the deterministic grounding check |
-| `scripts/verify_api.py` | 29 | none | the FastAPI endpoints |
-| `scripts/verify_mlb_data.py` | 113 | live (anchored) | the MLB data layer, tools, filters, cache |
+| `scripts/verify_api.py` | 51 | none | the FastAPI endpoints |
+| `scripts/verify_mlb_data.py` | 151 | live (anchored) | the MLB data layer, tools, filters, cache |
 | `scripts/run_eval.py` | 40 questions | live (models) | full-pipeline benchmark |
 
 ### verify_orchestrator.py (29, offline)
@@ -66,7 +66,7 @@ tries every ordered pair, so the numbers it accepts grow with the square of the
 retrieved data, and a leaderboard-sized result will accept a value that a
 two-number result correctly rejects.
 
-### verify_api.py (29, offline)
+### verify_api.py (51, offline)
 
 `TestClient` drives the app with the orchestrator and grounding calls faked and
 the database pointed at a temporary file. Covers `POST /ask` happy path
@@ -81,19 +81,35 @@ no leak). The daily limb of the rate limit can't be driven behaviourally (the
 per-minute limb trips at 6 requests, so the 50th is unreachable inside a
 minute), so it is asserted to be registered on the route instead.
 
-### verify_mlb_data.py (113, mixed)
+Also covers the two `/games/*` additions: `GET /games/{game_id}/boxscore` (200
+shape, 404 unknown id, 409 not yet started with the status in the detail, 502 with
+no leak, and that it is *not* on the `/ask` limiter), and
+`?fallback=last_played` (an empty day walks back to the most recent day with
+games and names it in `fell_back_to`, a non-empty day doesn't walk, the walk gives
+up past the day cap, and an unknown value is rejected rather than ignored). One
+trap worth knowing before adding schedule tests: the schedule cache is shared
+across checks in this file, so a day another fake already populated is served from
+cache. The cap check deliberately uses a date window no earlier check touches.
+
+### verify_mlb_data.py (151, mixed)
 
 A few `live_feature_checks` are conditional on there being games today, so the
-runtime count can be a couple lower than the 113 `check()` calls in the file.
+runtime count can be a couple lower than the 151 `check()` calls in the file.
 
 The main regression suite, in six groups:
 
 - offline_checks: defensive normalization (unknown status, empty fields),
-  the fantasy scoring formula on known lines, the box-score and date-range
-  normalizers, the `normalize_total_stat` grand-total selection (including
-  the no-`sport.id==0` fallback and the never-sum-the-duplicates rule), the
-  `gap_from_leader` magnitude on both a higher- and a lower-is-better
-  leaderboard, and the rate-stat classifier.
+  the fantasy scoring formula on known lines, the box-score batting and pitching
+  normalizers (header rows skipped, season rates excluded, the W/L/S decision
+  parsed out of the note, batting order and substitution passed through, and
+  `side` carried instead of the box score's own doubled-up team label) and the
+  date-range normalizers, the
+  `normalize_total_stat` grand-total selection (including the no-`sport.id==0`
+  fallback and the never-sum-the-duplicates rule), the `gap_from_leader`
+  magnitude on both a higher- and a lower-is-better leaderboard, the rate-stat
+  classifier, and that `_rank_value` scores a pitching line with the pitcher
+  formula — the same line under the hitter formula returns 0 for every pitcher,
+  silently, which is why the group is passed in rather than inferred.
 - live_checks: schedule, play-by-play, season, and career normalization
   anchored on a known 2024 game and Aaron Judge's 2024 line.
 - cache_checks: freshness (a stale row refetches), the whitelist guard, the
