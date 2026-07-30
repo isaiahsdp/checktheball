@@ -37,9 +37,10 @@ _STARTED_STATUSES = {"In Progress", "Manager challenge", "Final", "Game Over", "
 _GAME_HITTING_STATS = normalizer.BOX_HITTING_STATS
 _RANKABLE_STATS = _GAME_HITTING_STATS + ("fantasy",)
 
-# Today's pitchers are ranked by strikeouts only for now. A composite game-score
-# metric (K, ER, IP, ...) is deferred future work.
-_PITCHING_RANKABLE_STATS = ("strikeOuts",)
+# Today's-game stats a pitcher can be ranked by, plus "fantasy" for a computed
+# DraftKings pitcher score. Deliberately not a composite quality metric: every
+# entry here is either a raw counted stat or a published scoring formula.
+_PITCHING_RANKABLE_STATS = ("strikeOuts", "fantasy")
 
 # Stat groups each tool accepts. Season leaderboards pass all three through to
 # the MLB leader API; everything else has a per-group formula or method that
@@ -474,8 +475,17 @@ def _todays_pitching_lines(date: str | None) -> list[dict[str, Any]]:
     )
 
 
-def _rank_value(stats: dict[str, Any], stat: str) -> float:
+def _rank_value(stats: dict[str, Any], stat: str, group: str = "hitting") -> float:
+    """Value to rank a today's line by. ``group`` picks the fantasy formula.
+
+    The group is passed in rather than inferred from which keys are present: a
+    pitching line scored with the hitter formula matches nothing and quietly
+    returns 0 for every pitcher instead of failing.
+    """
     if stat == "fantasy":
+        if group == "pitching":
+            scored = {key: stats.get(src, 0) for key, src in _SEASON_TO_FANTASY_PITCHING.items()}
+            return fantasy.pitcher_points(scored)
         return fantasy.hitter_points(stats)
     value = stats.get(stat)
     return value if isinstance(value, (int, float)) else 0
@@ -544,14 +554,16 @@ def _todays_top_performers(stat: str, limit: int, date: str | None) -> dict[str,
 
 
 def _todays_pitching_performers(stat: str, limit: int, date: str | None) -> dict[str, Any]:
-    """Rank today's pitchers by a single counting stat (strikeouts only for now).
+    """Rank today's pitchers by strikeouts or by computed fantasy points.
 
-    This is a most-strikeouts ranking, not a composite "best pitching
-    performance" score. Same leaderboard shape as the hitting path.
+    ``stat="fantasy"`` scores the DraftKings pitcher formula. Today's lines carry
+    every input it takes, including the win, hit batsmen, and complete-game
+    flags, so the score is the full formula rather than a partial one. Still not
+    a composite quality metric: it is DraftKings scoring, nothing invented.
     """
     if stat not in _PITCHING_RANKABLE_STATS:
         return {
-            "error": f"Can't rank today's pitchers by '{stat}'. Only strikeouts is supported.",
+            "error": f"Can't rank today's pitchers by '{stat}'.",
             "available_stats": list(_PITCHING_RANKABLE_STATS),
         }
 
@@ -559,18 +571,22 @@ def _todays_pitching_performers(stat: str, limit: int, date: str | None) -> dict
     if not pitchers:
         return {"error": "No games have started yet for that date."}
 
-    pitchers.sort(key=lambda p: _rank_value(p["stats"], stat), reverse=True)
+    pitchers.sort(key=lambda p: _rank_value(p["stats"], stat, "pitching"), reverse=True)
     leaders = [
         {
             "player": p["player"],
             "team": p["team"],
-            "value": _rank_value(p["stats"], stat),
+            "value": _rank_value(p["stats"], stat, "pitching"),
+            "fantasy_points": _rank_value(p["stats"], "fantasy", "pitching"),
             "line": p["stats"],
         }
         for p in pitchers[: max(1, limit)]
     ]
     _add_gap_from_leader(leaders)
-    return {"scope": "today", "date": date or "today", "stat": stat, "group": "pitching", "pitchers_counted": len(pitchers), "leaders": leaders}
+    result = {"scope": "today", "date": date or "today", "stat": stat, "group": "pitching", "pitchers_counted": len(pitchers), "leaders": leaders}
+    if stat == "fantasy":
+        result["scoring"] = fantasy.SCORING_SYSTEM_PITCHING
+    return result
 
 
 def get_top_performers(
@@ -696,8 +712,70 @@ def get_fantasy_points(
     return {"error": f"No player matching '{player}' found in today's games. Specify a season for season totals."}
 
 
+# A box-score pitching line maps onto the pitcher fantasy formula's keys. The
+# win comes from the line's W/L/S decision; the game feed exposes no hit
+# batsmen, complete game, or no-hitter flag, so those stay 0 (the same
+# data-availability limit that drops hit-by-pitch from a hitter's score).
+_BOX_TO_FANTASY_PITCHING = {"ip": "ip", "k": "k", "er": "er", "h": "h", "bb": "bb"}
+
+
+def _pitcher_line_points(line: dict[str, Any]) -> float:
+    scored = {key: line["stats"].get(src, 0) for key, src in _BOX_TO_FANTASY_PITCHING.items()}
+    scored["w"] = 1 if line.get("decision") == "W" else 0
+    return fantasy.pitcher_points(scored)
+
+
+def _boxscore_for_game(game: dict[str, Any]) -> dict[str, Any]:
+    """One schedule entry -> its batting and pitching lines.
+
+    Batters are sorted best fantasy line first, since that answers "who is
+    performing". Pitchers keep the feed's order (starter, then relievers as they
+    appeared), which is how a box score reads. Shared by both lookup paths so
+    they cannot drift.
+    """
+    if game.get("status") not in _STARTED_STATUSES:
+        return {
+            "error": f"The {game.get('away_name')} at {game.get('home_name')} game hasn't started yet.",
+            "status": game.get("status"),
+        }
+
+    raw = _cached_boxscore(game["game_id"])
+    # The schedule carries the real team names; the box score's own team fields
+    # are display abbreviations that double up ("NY Mets Mets") and disagree with
+    # these ("Arizona D-backs" vs "Arizona Diamondbacks"). Label each line from
+    # its side so team always equals away_team or home_team exactly.
+    team_for = {"away": game.get("away_name"), "home": game.get("home_name")}
+
+    batters = normalizer.normalize_boxscore_batters(raw)
+    for batter in batters:
+        batter["team"] = team_for.get(batter["side"])
+        batter["fantasy_points"] = fantasy.hitter_points(batter["stats"])
+    batters.sort(key=lambda b: b["fantasy_points"], reverse=True)
+
+    pitchers = normalizer.normalize_boxscore_pitchers(raw)
+    for pitcher in pitchers:
+        pitcher["team"] = team_for.get(pitcher["side"])
+        pitcher["fantasy_points"] = _pitcher_line_points(pitcher)
+
+    return {
+        "away_team": game.get("away_name"),
+        "home_team": game.get("home_name"),
+        "status": game.get("status"),
+        "away_score": game.get("away_score"),
+        "home_score": game.get("home_score"),
+        "scoring": fantasy.SCORING_SYSTEM,
+        "batters": batters,
+        "pitchers": pitchers,
+    }
+
+
 def get_game_boxscore(team_a: str, team_b: str, date: str | None = None) -> dict[str, Any]:
-    """Batting lines for a single game today, identified by its two teams."""
+    """Batting lines for a single game today, identified by its two teams.
+
+    First schedule match wins, so this cannot reach the second game of a
+    doubleheader. Use ``get_game_boxscore_by_id`` when the caller already has a
+    game_id.
+    """
     game = next(
         (
             g
@@ -709,26 +787,27 @@ def get_game_boxscore(team_a: str, team_b: str, date: str | None = None) -> dict
     )
     if game is None:
         return {"error": f"No game found between '{team_a}' and '{team_b}' for that date."}
-    if game.get("status") not in _STARTED_STATUSES:
-        return {
-            "error": f"The {game.get('away_name')} at {game.get('home_name')} game hasn't started yet.",
-            "status": game.get("status"),
-        }
+    box = _boxscore_for_game(game)
+    if "error" in box:
+        return box
+    return {"date": date or "today", **box}
 
-    batters = normalizer.normalize_boxscore_batters(_cached_boxscore(game["game_id"]))
-    for batter in batters:
-        batter["fantasy_points"] = fantasy.hitter_points(batter["stats"])
-    batters.sort(key=lambda b: b["fantasy_points"], reverse=True)
-    return {
-        "date": date or "today",
-        "away_team": game.get("away_name"),
-        "home_team": game.get("home_name"),
-        "status": game.get("status"),
-        "away_score": game.get("away_score"),
-        "home_score": game.get("home_score"),
-        "scoring": fantasy.SCORING_SYSTEM,
-        "batters": batters,
-    }
+
+def get_game_boxscore_by_id(game_id: int | str, date: str | None = None) -> dict[str, Any]:
+    """Batting lines for one game by its schedule game_id.
+
+    Not registered as a Claude tool: the model asks by team name, while a client
+    that already listed the schedule holds the id. An id also identifies each
+    half of a doubleheader, which a team pair cannot.
+    """
+    wanted = str(game_id)
+    game = next((g for g in _cached_schedule(date) if str(g.get("game_id")) == wanted), None)
+    if game is None:
+        return {"error": f"No game found with id '{game_id}' for that date."}
+    box = _boxscore_for_game(game)
+    if "error" in box:
+        return box
+    return {"date": date or "today", **box}
 
 
 TOOL_FUNCTIONS = {
@@ -834,8 +913,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "across today's games ('who is the top performer today', 'most "
             "fantasy points today'); the stat uses single-game keys like 'h', "
             "'hr', 'rbi', or 'fantasy'. With scope='today' and group='pitching' it "
-            "ranks today's pitchers by strikeouts (stat='strikeOuts'); this is a "
-            "most-strikeouts ranking only, not a composite best-performance score. "
+            "ranks today's pitchers by strikeouts (stat='strikeOuts') or by computed "
+            "DraftKings pitcher fantasy points (stat='fantasy'); use 'fantasy' for "
+            "'who pitched best today'. There is no composite quality metric beyond "
+            "those two. "
             "Each leader entry includes 'gap_from_leader', the precomputed size of "
             "its gap behind the top player, always a positive number (0 for the "
             "leader, and still positive for lower-is-better categories like "

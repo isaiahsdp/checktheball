@@ -198,13 +198,17 @@ def normalize_boxscore_batters(raw: dict[str, Any]) -> list[dict[str, Any]]:
 
     Header and total rows (personId 0) are dropped; stats are this game's
     counting totals coerced to numbers.
+
+    Carries ``side`` rather than a team label: the box score's own team fields
+    are display abbreviations that neither match the schedule's names nor each
+    other ("NY Mets Mets", "Arizona D-backs"), so the caller that knows the real
+    names fills those in from the side. ``batting_order`` keeps the slot and the
+    substitution suffix together (401 is the first sub in the 4th slot), so a
+    caller can sort by it and still nest subs under the starter they replaced.
     """
-    team_info = raw.get("teamInfo", {})
     player_info = raw.get("playerInfo", {})
     lines: list[dict[str, Any]] = []
     for side in ("away", "home"):
-        info = team_info.get(side, {})
-        team = f"{info.get('shortName', '')} {info.get('teamName', '')}".strip()
         for batter in raw.get(f"{side}Batters", []):
             person_id = batter.get("personId")
             if not person_id:  # skip header / total rows
@@ -214,9 +218,64 @@ def normalize_boxscore_batters(raw: dict[str, Any]) -> list[dict[str, Any]]:
             lines.append(
                 {
                     "player": full_name or batter.get("name"),
-                    "team": team,
+                    "side": side,
                     "position": batter.get("position"),
+                    "batting_order": _int_or_none(batter.get("battingOrder")),
+                    "substitution": bool(batter.get("substitution")),
                     "stats": {k: to_number(batter.get(k)) for k in BOX_HITTING_STATS},
+                }
+            )
+    return lines
+
+
+# Box-score pitching fields for this game. The era in a box score is the
+# pitcher's season rate, not this outing, so it is left out for the same reason
+# avg/ops are left out of the batting line. "p"/"s" are renamed because single
+# letters make poor JSON keys.
+_BOX_PITCHING_STATS = {
+    "ip": "ip",
+    "h": "h",
+    "r": "r",
+    "er": "er",
+    "bb": "bb",
+    "k": "k",
+    "hr": "hr",
+    "pitches": "p",
+    "strikes": "s",
+}
+
+# Leading marker in a box-score note: "(W, 5-2)", "(L, 0-1)", "(S, 12)".
+_DECISIONS = ("W", "L", "S", "H", "BS")
+
+
+def _decision_from_note(note: str) -> str | None:
+    """The W/L/S marker a box score puts in a pitcher's note, if any."""
+    marker = (note or "").lstrip("(").split(",")[0].strip()
+    return marker if marker in _DECISIONS else None
+
+
+def normalize_boxscore_pitchers(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Box-score payload -> one pitching line per player across both teams.
+
+    Kept in the order the feed returns (starter first, then relievers in
+    appearance order), which is how a box score reads. Header/total rows
+    (personId 0) are dropped. Carries ``side`` rather than a team label, for the
+    same reason as the batting lines.
+    """
+    player_info = raw.get("playerInfo", {})
+    lines: list[dict[str, Any]] = []
+    for side in ("away", "home"):
+        for pitcher in raw.get(f"{side}Pitchers", []):
+            person_id = pitcher.get("personId")
+            if not person_id:  # skip header / total rows
+                continue
+            full_name = player_info.get(f"ID{person_id}", {}).get("fullName")
+            lines.append(
+                {
+                    "player": full_name or pitcher.get("name"),
+                    "side": side,
+                    "decision": _decision_from_note(pitcher.get("note", "")),
+                    "stats": {k: to_number(pitcher.get(src)) for k, src in _BOX_PITCHING_STATS.items()},
                 }
             )
     return lines
