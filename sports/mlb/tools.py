@@ -431,9 +431,11 @@ def compute_pace_projection(
 
 
 def _cached_schedule(date: str | None) -> list[dict[str, Any]]:
-    key = f"raw_schedule:{date or 'today'}"
+    # Key on the real date, never a literal "today": across midnight a row that
+    # is still fresh would resolve a game against the previous day's slate.
+    day = date or datetime.now().strftime("%Y-%m-%d")
     return db.cached_fetch(
-        "games", key, SPORT, lambda: client.get_schedule(date=date), _SCHEDULE_MAX_AGE_SECONDS
+        "games", f"raw_schedule:{day}", SPORT, lambda: client.get_schedule(date=date), _SCHEDULE_MAX_AGE_SECONDS
     )
 
 

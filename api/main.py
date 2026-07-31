@@ -68,8 +68,12 @@ def _load_games(date: str | None) -> list[dict[str, Any]]:
         raw = client.get_schedule(date=date)
         return [normalizer.normalize_game(g).to_dict() for g in raw]
 
+    # Resolve "today" to the real date for the key. Keyed on a literal "today",
+    # a row written just before midnight is still inside its freshness window
+    # after the rollover and would be served as the new day's schedule.
+    day = date or datetime.now().strftime("%Y-%m-%d")
     return db.cached_fetch(
-        "games", f"schedule:{date or 'today'}", normalizer.SPORT, fetch, LIVE_GAMES_MAX_AGE_SECONDS
+        "games", f"schedule:{day}", normalizer.SPORT, fetch, LIVE_GAMES_MAX_AGE_SECONDS
     )
 
 
