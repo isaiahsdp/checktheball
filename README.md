@@ -48,13 +48,65 @@ scoring for hitters and pitchers.
 
 - `sports/<sport>/`: per-sport data and tools (MLB first)
 - `core/`: shared logic, sport-agnostic
-- `api/`: FastAPI service (`POST /ask`, `GET /games/live`)
+- `api/`: FastAPI service (`POST /ask`, plus the `/games/*` side reads)
 
 ## API
 
-**`POST /ask`**: ask a question, get an answer with its grounding score and
-the data it was checked against. Rate-limited per IP, since each call makes
-a real, paid model request.
+**`POST /ask`**: ask a question, get an answer with its grounding
+score and the data it was checked against. Rate-limited per IP, since each call
+makes a real, paid model request.
+
+```bash
+curl -s localhost:8000/ask -H 'Content-Type: application/json' \
+  -d '{"question": "How many home runs did Aaron Judge hit in 2024?"}'
+```
+
+```json
+{
+  "question": "How many home runs did Aaron Judge hit in 2024?",
+  "answer": "Aaron Judge hit 58 home runs in the 2024 season.",
+  "grounding_score": 1.0,
+  "grounding": {
+    "supported_claims": 1,
+    "total_claims": 1,
+    "claims": [
+      {
+        "text": "Aaron Judge hit 58 home runs in the 2024 season",
+        "values": ["Aaron Judge", "58"],
+        "supported": true,
+        "missing": []
+      }
+    ]
+  },
+  "tool_calls": [
+    {
+      "name": "get_player_stat",
+      "input": { "player": "Aaron Judge", "stat": "homeRuns", "season": 2024 },
+      "result": {
+        "player": "Aaron Judge",
+        "player_id": "592450",
+        "team": "New York Yankees",
+        "stat": "homeRuns",
+        "value": 58,
+        "scope": "season",
+        "season": 2024,
+        "group": "hitting"
+      }
+    }
+  ]
+}
+```
+
+`grounding_score` is supported claims over total, and any value a claim asserts
+that wasn't found in the retrieved data is listed in `missing`. `tool_calls`
+carries what was actually executed and what came back, so a client can show the
+numbers the answer was checked against rather than asking you to trust it.
+
+The two `/games/*` endpoints below are side reads, not part of the grounded Q&A
+pipeline. They make no model call, run no verification, and exist to back a
+scoreboard UI, so they can change without notice. MLB only for now: they call
+the MLB modules directly rather than going through the sport-agnostic core, so
+another sport would mean its own endpoints.
 
 **`GET /games/live`**: today's games and scores. Pass
 `?fallback=last_played` and an empty day returns the most recent day that had

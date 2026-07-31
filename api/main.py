@@ -1,9 +1,10 @@
 """FastAPI app exposing the CheckTheBall pipeline over HTTP.
 
-Two endpoints back the product: ``GET /games/live`` lists today's games from
-the MLB feed, and ``POST /ask`` runs a question through the orchestrator, scores
+``POST /ask`` is the product: it runs a question through the orchestrator, scores
 the answer with the grounding layer, logs it, and returns all three together so
-a client can show the answer alongside how well it traces back to the data.
+a client can show the answer alongside how well it traces back to the data. The
+``/games/*`` reads are a side surface for a scoreboard UI: no model call, no
+verification, and no other part of the pipeline depends on them.
 """
 
 from __future__ import annotations
@@ -44,7 +45,6 @@ ASK_RATE_LIMIT_PER_MINUTE = 5
 ASK_RATE_LIMIT_PER_DAY = 50
 ASK_RATE_LIMIT = f"{ASK_RATE_LIMIT_PER_MINUTE}/minute;{ASK_RATE_LIMIT_PER_DAY}/day"
 limiter = Limiter(key_func=get_remote_address)
-
 
 # Sweeping only at startup would never fire on a server that stays up for
 # months, which is exactly when the cache has grown enough to matter.
