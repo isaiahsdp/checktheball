@@ -8,6 +8,7 @@ a client can show the answer alongside how well it traces back to the data.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -45,10 +46,34 @@ ASK_RATE_LIMIT = f"{ASK_RATE_LIMIT_PER_MINUTE}/minute;{ASK_RATE_LIMIT_PER_DAY}/d
 limiter = Limiter(key_func=get_remote_address)
 
 
+# Sweeping only at startup would never fire on a server that stays up for
+# months, which is exactly when the cache has grown enough to matter.
+CACHE_SWEEP_INTERVAL_SECONDS = 24 * 60 * 60
+
+
+async def _sweep_cache_periodically() -> None:
+    while True:
+        await asyncio.sleep(CACHE_SWEEP_INTERVAL_SECONDS)
+        try:
+            # to_thread: sweep_cache is blocking sqlite, and the event loop has
+            # requests to serve.
+            removed = await asyncio.to_thread(db.sweep_cache)
+            logger.info("Cache sweep removed %d rows", removed)
+        except Exception:
+            # A failed sweep is not worth dropping requests over, and it must
+            # not kill the loop: the next pass gets what this one missed.
+            logger.exception("Cache sweep failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()  # ensure the cache tables and query log exist before serving
-    yield
+    db.sweep_cache()  # drop what expired while the process was down
+    sweeper = asyncio.create_task(_sweep_cache_periodically())
+    try:
+        yield
+    finally:
+        sweeper.cancel()
 
 
 app = FastAPI(title="CheckTheBall", version="0.1.0", lifespan=lifespan)
