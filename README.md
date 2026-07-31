@@ -144,3 +144,10 @@ uvicorn api.main:app --port 8000 --reload
 
 Serves on `http://localhost:8000`. `GET /games/live` works without a key;
 `POST /ask` needs `ANTHROPIC_API_KEY` set in `.env`.
+
+### What it costs to run
+
+Every `POST /ask` makes two paid Anthropic calls on your key: a Sonnet call for
+the tool-use loop and answer, and a Haiku call to extract the answer's claims
+for grounding. Caching does not change that, so asking the same question twice
+costs the same as asking it once.
