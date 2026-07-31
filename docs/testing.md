@@ -66,7 +66,7 @@ tries every ordered pair, so the numbers it accepts grow with the square of the
 retrieved data, and a leaderboard-sized result will accept a value that a
 two-number result correctly rejects.
 
-### verify_api.py (51, offline)
+### verify_api.py (54, offline)
 
 `TestClient` drives the app with the orchestrator and grounding calls faked and
 the database pointed at a temporary file. Covers `POST /ask` happy path
@@ -91,10 +91,16 @@ trap worth knowing before adding schedule tests: the schedule cache is shared
 across checks in this file, so a day another fake already populated is served from
 cache. The cap check deliberately uses a date window no earlier check touches.
 
-### verify_mlb_data.py (151, mixed)
+A request with no `date` must cache under the real date, so the row written by
+`/games/live` is asserted to be keyed `schedule:<today>` with no literal
+`schedule:today` key present. Keyed on the string, a row written just before
+midnight is still inside its freshness window after the rollover and serves the
+previous day's slate.
+
+### verify_mlb_data.py (157, mixed)
 
 A few `live_feature_checks` are conditional on there being games today, so the
-runtime count can be a couple lower than the 151 `check()` calls in the file.
+runtime count can be a couple lower than the 157 `check()` calls in the file.
 
 The main regression suite, in six groups:
 
@@ -113,8 +119,13 @@ The main regression suite, in six groups:
 - live_checks: schedule, play-by-play, season, and career normalization
   anchored on a known 2024 game and Aaron Judge's 2024 line.
 - cache_checks: freshness (a stale row refetches), the whitelist guard, the
-  upsert (same key replaced in place, no duplicate row), and `log_query` writing
-  a row verbatim.
+  upsert (same key replaced in place, no duplicate row), `log_query` writing
+  a row verbatim, the eviction sweep (an aged row deleted, a recent one kept,
+  the count reported, and `queries` left alone — the sweep is cache-only), and
+  that `_cached_schedule` keys on the real date rather than a literal "today".
+  The sweep check backdates `updated_at` directly, since `write_cache` always
+  stamps now; the key check stubs `cached_fetch` to capture the key, which keeps
+  it offline and off the real database.
 - tool_checks: each Claude-facing tool against known 2024 numbers, error
   paths returning `{"error": ...}`, a pitching anchor (Skubal 2024), the
   rate-stat rejection in `compute_pace_projection`, the pitcher pace scaling at
