@@ -25,6 +25,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 # Make the project importable when run as a plain script.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -345,6 +346,53 @@ def cache_checks() -> None:
         finally:
             con.close()
         check("write_cache: upsert leaves a single row (no duplicate)", count == 1)
+
+        # The sweep drops aged cache rows and leaves the query log alone. Rows
+        # are backdated directly since write_cache always stamps "now".
+        db.write_cache("games", "aged_row", "mlb", {"v": 1}, db_path)
+        db.write_cache("games", "recent_row", "mlb", {"v": 2}, db_path)
+        con = sqlite3.connect(db_path)
+        try:
+            aged = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+            con.execute("UPDATE games SET updated_at = ? WHERE key = 'aged_row'", (aged,))
+            con.commit()
+            queries_before = con.execute("SELECT COUNT(*) FROM queries").fetchone()[0]
+        finally:
+            con.close()
+
+        removed = db.sweep_cache(7, db_path)
+        check("sweep: aged row deleted", db.read_cache("games", "aged_row", db_path=db_path) is None)
+        check("sweep: recent row kept", db.read_cache("games", "recent_row", db_path=db_path) == {"v": 2})
+        check("sweep: reports what it removed", removed >= 1)
+        con = sqlite3.connect(db_path)
+        try:
+            queries_after = con.execute("SELECT COUNT(*) FROM queries").fetchone()[0]
+        finally:
+            con.close()
+        check("sweep: query log untouched", queries_after == queries_before)
+
+        # _cached_schedule must key on the real date. Under a literal "today"
+        # key, a row written just before midnight is still fresh after the
+        # rollover and resolves a game against the previous day's slate.
+        # cached_fetch is stubbed so this stays offline and off the real DB.
+        seen = {}
+        original_cached_fetch = db.cached_fetch
+
+        def spy(table, key, sport, fetch_fn, max_age, *args, **kwargs):
+            seen["key"] = key
+            return []
+
+        db.cached_fetch = spy
+        try:
+            tools._cached_schedule(None)
+            implicit = seen["key"]
+            tools._cached_schedule("2024-06-01")
+            explicit = seen["key"]
+        finally:
+            db.cached_fetch = original_cached_fetch
+        today = datetime.now().strftime("%Y-%m-%d")
+        check("schedule key: implicit today carries the real date", implicit == f"raw_schedule:{today}")
+        check("schedule key: explicit date preserved", explicit == "raw_schedule:2024-06-01")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

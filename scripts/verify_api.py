@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -265,6 +266,21 @@ def games_live_happy_path() -> None:
     check("games happy: live_count filters to state==live (2)", body["live_count"] == 2 and live_in_list == 2)
 
 
+def games_live_today_key_is_dated() -> None:
+    # A request with no date must cache under the real date. Under a literal
+    # "today" key, a row written just before midnight is still fresh after the
+    # rollover, so the next day's first callers get the previous day's games.
+    client.get_schedule = _schedule_ok
+    with TestClient(main.app) as tc:
+        r = tc.get("/games/live")
+    check("today key: 200", r.status_code == 200)
+    with sqlite3.connect(_DB_PATH) as con:
+        keys = {row[0] for row in con.execute("SELECT key FROM games")}
+    today = datetime.now().strftime("%Y-%m-%d")
+    check("today key: row is keyed by the real date", f"schedule:{today}" in keys)
+    check("today key: no literal 'today' key written", "schedule:today" not in keys)
+
+
 def games_live_fetch_raises() -> None:
     client.get_schedule = _schedule_boom
     with TestClient(main.app) as tc:
@@ -405,6 +421,7 @@ def main_() -> int:
         ask_rate_limit()
         ask_daily_limit_registered()
         games_live_happy_path()
+        games_live_today_key_is_dated()
         games_live_fetch_raises()
         games_live_fallback()
         boxscore_endpoint()
