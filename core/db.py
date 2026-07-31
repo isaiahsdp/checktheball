@@ -16,7 +16,7 @@ import json
 import os
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 DEFAULT_DB_PATH = os.environ.get("CHECKTHEBALL_DB", "checktheball.sqlite")
@@ -24,6 +24,11 @@ DEFAULT_DB_PATH = os.environ.get("CHECKTHEBALL_DB", "checktheball.sqlite")
 # Whitelisted cache tables. Table names can't be parameterized in SQL, so we
 # validate against this set to keep the API injection-safe.
 _TABLES = ("games", "plays", "player_stats_cache")
+
+# Freshness windows only decide whether a row is worth reading; nothing deletes
+# it. Most keys are never requested twice (a finished game's box score is fixed
+# and asked for once), so without a sweep the file grows without bound.
+CACHE_RETENTION_DAYS = 7
 
 
 def _connect(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -145,6 +150,26 @@ def write_cache(
             (key, sport, data, _now()),
         )
         conn.commit()
+
+
+def sweep_cache(
+    max_age_days: float = CACHE_RETENTION_DAYS,
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    """Delete cache rows older than ``max_age_days``; return how many went.
+
+    Cache tables only. The query log is real data, not a disposable copy, so it
+    is never swept. Deleting a row that is still wanted costs one refetch.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    removed = 0
+    with closing(_connect(db_path)) as conn:
+        for table in _TABLES:
+            removed += conn.execute(
+                f"DELETE FROM {table} WHERE updated_at < ?", (cutoff,)
+            ).rowcount
+        conn.commit()
+    return removed
 
 
 def cached_fetch(
