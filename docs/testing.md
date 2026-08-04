@@ -31,13 +31,13 @@ tests trustworthy.
 
 | Suite | Checks | Network | What it covers |
 |---|---|---|---|
-| `scripts/verify_orchestrator.py` | 29 | none | the tool-use loop |
-| `scripts/verify_grounding.py` | 28 | none | the deterministic grounding check |
-| `scripts/verify_api.py` | 51 | none | the FastAPI endpoints |
-| `scripts/verify_mlb_data.py` | 151 | live (anchored) | the MLB data layer, tools, filters, cache |
+| `scripts/verify_orchestrator.py` | 56 | none | the tool-use loop |
+| `scripts/verify_grounding.py` | 37 | none | the deterministic grounding check |
+| `scripts/verify_api.py` | 54 | none | the FastAPI endpoints |
+| `scripts/verify_mlb_data.py` | 156 | live (anchored) | the MLB data layer, tools, filters, cache |
 | `scripts/run_eval.py` | 40 questions | live (models) | full-pipeline benchmark |
 
-### verify_orchestrator.py (29, offline)
+### verify_orchestrator.py (56, offline)
 
 A scripted fake Claude client and fake tool provider exercise the loop's
 mechanics: a single tool call, a multi-round chain, an out-of-scope answer with
@@ -47,9 +47,17 @@ blocks in one response, both executed with both results returned in one turn).
 Also asserts what each request's system prompt carries: the current date, so the
 model resolves "this season" against reality instead of guessing from its
 training, and the rule that a number the model works out itself is not verified
-data (the rule `gap_from_leader` and the derived-ratio fallback exist to serve).
+data (the rule `gap_from_leader` and the `compute` tool exist to serve).
 
-### verify_grounding.py (28, offline)
+Also covers the `compute` tool: the operand check that refuses numbers no tool
+returned, each operation and its guards (divide by zero, unknown operation, a
+single operand, a non-numeric operand), and its wiring into the loop: handled
+by the orchestrator rather than dispatched to the sport provider, offered
+alongside the provider's schemas without mutating them, recorded in
+`tool_calls_made` like any other call, and a refused operand fed back as an
+error the model can correct.
+
+### verify_grounding.py (37, offline)
 
 A scripted extractor stands in for Haiku so the deterministic verification is
 tested without a model. Covers fully grounded and partially grounded claim sets,
@@ -57,14 +65,25 @@ string vs number value forms, value-less claims being skipped, and several
 edges: a value present only in a tool's `input` (the query-faithfulness gap made
 explicit), a multi-value claim where only some values are backed, negative
 numbers, whether text inside an `{"error": ...}` string can spuriously ground a
-claim, a date-range claim that states the queried year, a simple derived rate
-(a number the model computed by dividing two grounded numbers) grounding while a
-non-ratio look-alike does not, and a leaderboard gap claim grounding via the
-precomputed `gap_from_leader` field (direct match, not the derived-ratio path).
-One check documents a limitation rather than a guarantee: the ratio fallback
-tries every ordered pair, so the numbers it accepts grow with the square of the
-retrieved data, and a leaderboard-sized result will accept a value that a
-two-number result correctly rejects.
+claim, and a date-range claim that states the queried year.
+
+Two paired sections carry the arithmetic design. One asserts that a number the
+model computed itself does not ground, covering a correct rate in decimal,
+percent, and rounded-percent form, and a correct difference, all unsupported on
+their own. The other runs the real `compute` tool and shows the same rate
+grounding once it arrives as a tool result. Re-adding an after-the-fact check
+would flip the first set, which is why they are guarded. A leaderboard gap is the same
+story landed at the source: it grounds via the precomputed `gap_from_leader`,
+and does not ground when that field is stripped.
+
+Two sections cover the conditions a stat was measured under, which are context
+rather than claims. An ISO date is recognized by shape and waved through, since
+a refusal citing today's date put one in `values` and scored 0.00; a bare year
+is still checked, and a partial date is not treated as one. An uppercase split
+label ("RHP") is checked as a proper noun and fails against data that says
+`vs_right`, so the extraction prompt excludes handedness and home/away labels
+the way it already excludes dates. The lowercase spelled-out form was never
+affected, which is why only abbreviated answers failed in production.
 
 ### verify_api.py (54, offline)
 
@@ -97,10 +116,10 @@ A request with no `date` must cache under the real date, so the row written by
 midnight is still inside its freshness window after the rollover and serves the
 previous day's slate.
 
-### verify_mlb_data.py (157, mixed)
+### verify_mlb_data.py (156, mixed)
 
 A few `live_feature_checks` are conditional on there being games today, so the
-runtime count can be a couple lower than the 157 `check()` calls in the file.
+runtime count can be several lower than the 167 `check()` calls in the file.
 
 The main regression suite, in six groups:
 
@@ -109,9 +128,10 @@ The main regression suite, in six groups:
   normalizers (header rows skipped, season rates excluded, the W/L/S decision
   parsed out of the note, batting order and substitution passed through, and
   `side` carried instead of the box score's own doubled-up team label) and the
-  date-range normalizers, the
-  `normalize_total_stat` grand-total selection (including the no-`sport.id==0`
-  fallback and the never-sum-the-duplicates rule), the `gap_from_leader`
+  date-range normalizers, the `normalize_total_stat` grand-total selection
+  (including the no-`sport.id==0` fallback and the never-sum-the-duplicates
+  rule), `team_from_splits` (reads the player's own team, never the vsTeam
+  `opponent`, and skips the teamless grand total), the `gap_from_leader`
   magnitude on both a higher- and a lower-is-better leaderboard, the rate-stat
   classifier, and that `_rank_value` scores a pitching line with the pitcher
   formula — the same line under the hitter formula returns 0 for every pitcher,
@@ -133,8 +153,10 @@ The main regression suite, in six groups:
   the identity case), and a check that every schema has a matching function.
 - filter_checks: date-range presets and a custom window, opponent, and split
   against stable 2024 facts, a lower-is-better leaderboard (2024 ERA leaders),
-  plus the guards (filters not combinable, a custom window needing both ends,
-  unknown values erroring cleanly).
+  every filtered path reporting the player's team the way the season line does
+  (so a stated team is retrieved data rather than recall), plus the guards
+  (filters not combinable, a custom window needing both ends, unknown values
+  erroring cleanly).
 - live_feature_checks: today's-games tools, structural and tolerant of
   off-days (assert shape and presence, not fixed numbers that change daily).
 

@@ -10,8 +10,11 @@ only parses language; the verification is a check against the source data.
 A claim is **supported** when every value it asserts is found in the retrieved
 data: numbers must match numerically, and named entities (players, teams,
 awards) must appear in the data. Lowercase descriptive labels ("home runs",
-"road games") are not treated as checkable facts. `grounding_score` is the
-fraction of a claim set that is supported.
+"road games") are not treated as checkable facts. Neither are the conditions a
+stat was measured under: calendar dates and spans, and the split a number came
+from ("RHP", "at home"). Both name which slice of data produced a number rather
+than asserting one, so the extractor leaves them out of a claim's values.
+`grounding_score` is the fraction of a claim set that is supported.
 
 ## Measured rate
 
@@ -59,16 +62,41 @@ correctly states is verifiable instead of missing.
   numeric check can in principle accept a number that is correct but attached to
   the wrong label. Verification is intentionally strict on numbers and lenient
   on descriptive phrasing.
-- It recognizes a **simple derived rate** as supported: a number the model got by
-  dividing two grounded numbers (e.g. "9.0 strikeouts per game" from 18
-  strikeouts over 2 games). The rate itself was never returned by a tool, but
-  both inputs were. This differs from fantasy points, which `sports/mlb/
-  fantasy.py` computes deterministically in code *before* the answer is written;
-  the derived-rate check instead verifies, after the fact, a ratio the model
-  already stated. It is division only (the demonstrated rate/average case) and
-  reuses the strict numeric tolerance so unrelated pairs don't coincidentally
-  match; values grounded this way are listed in each claim's `derived` field so a
-  false positive stays traceable.
+- It does **not** accept arithmetic the model did itself. A number is grounded
+  only if a tool returned it. A correct rate ("18.47% of his at-bats") whose
+  inputs were both retrieved still fails on its own, because the rate itself was
+  never retrieved.
+
+## Why arithmetic goes through a tool
+
+Grounding once had a fallback that accepted a number equal to the division of
+two retrieved numbers, on the theory that a rate the model computed from real
+inputs was safe. It was not. The check tried every ordered pair, so the set of
+accepted values grew with the square of the retrieved data while the space of
+plausible claims stayed fixed. Measured against a five-row leaderboard, it
+accepted **48% of all percentages between 0 and 100**, so an invented number was
+about as likely to pass as a real one.
+
+The two failure modes are not symmetric. A correct answer marked ungrounded is
+visible and cheap: it shows up in `scripts/review_queries.py` and points at a
+real gap. A fabricated number marked grounded is invisible and defeats the
+point of the layer. Verification should lean toward the first.
+
+So the fallback is gone, and `core/compute.py` replaces it. The model calls
+`compute` for a rate, difference, or total; the arithmetic runs in Python, and
+every operand is checked against the numbers already retrieved this turn, so
+the model can combine verified numbers but never introduce one. The result
+lands in the tool output and grounds by direct match like any other lookup.
+Division also returns the percentage at three precisions (`as_percent`,
+`as_percent_1dp`, `as_percent_whole`), because which one an answer states varies
+with the number. Returning all three means the rounded form actually written is
+a number a tool really returned, so the verifier needs no rounding tolerance of
+its own.
+
+This is the same move as `gap_from_leader` in `get_top_performers` and as
+`sports/mlb/fantasy.py`: compute deterministically in code, then verify the
+model reported it. Where a derived value is predictable for a given tool,
+precomputing it there is still preferred over a `compute` round trip.
 
 ## Limitations and future work
 
