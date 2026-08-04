@@ -15,12 +15,14 @@ Exit code is 0 if every check passes, 1 otherwise.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core.compute import COMPUTE_SCHEMA, run_compute
 from core.orchestrator import answer_question
 
 _passed = 0
@@ -209,9 +211,9 @@ def system_prompt_has_date() -> None:
 
 def system_prompt_forbids_own_math() -> None:
     # The rule that a number the model works out itself is not verified data. It
-    # is what motivates gap_from_leader in the tools and the derived-ratio
-    # fallback in grounding, so a silent edit to it would quietly change what the
-    # rest of the pipeline is compensating for.
+    # is what motivates gap_from_leader in the tools and the compute tool in
+    # core, so a silent edit to it would quietly change what the rest of the
+    # pipeline is built around.
     tools = FakeTools()
     client = FakeClient([answer("ok")])
     answer_question("q", tools, client=client)
@@ -225,8 +227,134 @@ def system_prompt_forbids_own_math() -> None:
         all(word in system_text for word in ("sum", "difference", "percentage", "per-game rate", "projection")),
     )
     check(
-        "system: points the model at a tool that computes it instead",
-        "Prefer a tool that computes" in system_text,
+        "system: points the model at the compute tool instead",
+        "Use the 'compute' tool" in system_text,
+    )
+    check(
+        "system: tells the model not to round a computed value further",
+        "do not round it further" in system_text,
+    )
+
+
+def compute_operand_validation() -> None:
+    # The guard that makes arithmetic-as-a-tool safe: operands must already be
+    # in this turn's results, so the model can combine verified numbers but
+    # never introduce one. Without this, compute would launder a hallucination
+    # into a grounded value.
+    results = [{"name": "get_player_stat", "input": {},
+                "result": {"player": "Trent Grisham", "strikeOuts": 41, "atBats": 222}}]
+
+    ok = run_compute({"operation": "divide", "operands": [41, 222]}, results)
+    check("compute: divides two retrieved numbers", ok["result"] == 0.1847)
+    # All three precisions, because which one an answer states varies with the
+    # number. A live 0.00 came from returning only 18.47 and 18 while the model
+    # wrote "about 18.5%".
+    check("compute: a rate also comes back as a percentage", ok["as_percent"] == 18.47)
+    check("compute: at one decimal place, the form that caused a live miss", ok["as_percent_1dp"] == 18.5)
+    check("compute: and as a whole percent", ok["as_percent_whole"] == 18)
+
+    invented = run_compute({"operation": "divide", "operands": [50, 200]}, results)
+    check("compute: operands no tool returned are refused", "error" in invented)
+    check(
+        "compute: the error names the offending operands",
+        "50.0" in invented["error"] and "200.0" in invented["error"],
+    )
+
+    # Half-invented is still refused: 41 is real, 300 is not.
+    partly = run_compute({"operation": "divide", "operands": [41, 300]}, results)
+    check("compute: one bad operand fails the whole call", "error" in partly)
+
+    # Nothing retrieved yet (compute called before its inputs) fails the same way.
+    early = run_compute({"operation": "divide", "operands": [41, 222]}, [])
+    check("compute: called before any lookup, nothing validates", "error" in early)
+
+
+def compute_operations() -> None:
+    results = [{"name": "compare_players", "input": {}, "result": {
+        "players": [{"player": "Aaron Judge", "value": 17},
+                    {"player": "Shohei Ohtani", "value": 24}], "atBats": 0}}]
+    check(
+        "compute: subtract is left to right, so order carries the sign",
+        run_compute({"operation": "subtract", "operands": [24, 17]}, results)["result"] == 7,
+    )
+    check(
+        "compute: add totals across sources",
+        run_compute({"operation": "add", "operands": [24, 17]}, results)["result"] == 41,
+    )
+    check(
+        "compute: non-divide results carry no percentage form",
+        "as_percent" not in run_compute({"operation": "add", "operands": [24, 17]}, results),
+    )
+    check(
+        "compute: dividing by a retrieved zero is refused, not a crash",
+        "error" in run_compute({"operation": "divide", "operands": [17, 0]}, results),
+    )
+    check(
+        "compute: an unknown operation is refused",
+        "error" in run_compute({"operation": "power", "operands": [24, 17]}, results),
+    )
+    check(
+        "compute: a single operand is not an operation",
+        "error" in run_compute({"operation": "add", "operands": [24]}, results),
+    )
+    check(
+        "compute: a non-numeric operand is refused",
+        "error" in run_compute({"operation": "add", "operands": [24, "17"]}, results),
+    )
+
+
+def compute_in_the_loop() -> None:
+    # End to end through the real loop: look a stat up, then compute a rate from
+    # it. compute is handled by the orchestrator, never dispatched to the sport
+    # provider, and its result lands in tool_results like any other retrieval.
+    tools = FakeTools()
+    client = FakeClient([
+        tool_use("lookup", {"stat": "strikeOuts"}, "t1"),
+        tool_use("compute", {"operation": "divide", "operands": [58, 58]}, "t2"),
+        answer("That is a rate of 1.0."),
+    ])
+    result = answer_question("q", tools, client=client)
+    check("compute loop: the sport provider never sees the compute call",
+          [name for name, _ in tools.calls] == ["lookup"])
+    check("compute loop: compute is recorded as a tool call like any other",
+          [c["name"] for c in result["tool_calls_made"]] == ["lookup", "compute"])
+    computed = result["tool_results"][1]["result"]
+    check("compute loop: the computed value lands in tool_results", computed["result"] == 1.0)
+
+    # The schema is offered alongside the provider's tools, not instead of them.
+    offered = [t["name"] for t in client.messages.requests[0]["tools"]]
+    check("compute loop: schema offered next to the sport's tools", offered == ["lookup", "compute"])
+    check("compute loop: the provider's own schemas are untouched",
+          [t["name"] for t in FakeTools.TOOL_SCHEMAS] == ["lookup"])
+
+
+def compute_error_reaches_the_model() -> None:
+    # A refused operand must come back as a tool_result flagged is_error, so the
+    # model can correct itself instead of the request failing.
+    tools = FakeTools()
+    client = FakeClient([
+        tool_use("compute", {"operation": "divide", "operands": [50, 200]}, "t1"),
+        answer("I could not verify that number."),
+    ])
+    result = answer_question("q", tools, client=client)
+    follow_up = client.messages.requests[1]["messages"][-1]["content"][0]
+    check("compute error: fed back to the model as an error result", follow_up["is_error"] is True)
+    check("compute error: the refusal names the operands, not a generic failure",
+          "50.0" in json.loads(follow_up["content"])["error"])
+    check("compute error: the loop still produces an answer",
+          result["answer"] == "I could not verify that number.")
+
+
+def compute_schema_shape() -> None:
+    check("compute schema: named 'compute'", COMPUTE_SCHEMA["name"] == "compute")
+    check(
+        "compute schema: offers exactly the four arithmetic operations",
+        COMPUTE_SCHEMA["input_schema"]["properties"]["operation"]["enum"]
+        == ["add", "subtract", "multiply", "divide"],
+    )
+    check(
+        "compute schema: tells the model operands must already be retrieved",
+        "already returned" in COMPUTE_SCHEMA["description"],
     )
 
 
@@ -241,6 +369,11 @@ def main() -> int:
     parallel_tool_calls()
     system_prompt_has_date()
     system_prompt_forbids_own_math()
+    compute_operand_validation()
+    compute_operations()
+    compute_in_the_loop()
+    compute_error_reaches_the_model()
+    compute_schema_shape()
     print(f"\n{_passed} passed, {_failed} failed")
     return 1 if _failed else 0
 

@@ -205,6 +205,34 @@ def offline_checks() -> None:
     check("date-range pitching normalizer: fields mapped and coerced", pitchers[0]["stats"]["strikeOuts"] == 9 and pitchers[0]["stats"]["earnedRuns"] == 1 and pitchers[0]["stats"]["inningsPitched"] == 7.0)
     check("date-range pitching normalizer: empty payload -> []", normalizer.normalize_date_range_pitchers({}) == [])
 
+    # team_from_splits reads the player's own team off any split-bearing payload,
+    # so a filtered lookup reports a team the way a season line already does. A
+    # live 0.00 came from this being absent: the answer said "Grisham (Yankees)"
+    # and the team, true but unretrieved, could not ground.
+    split_payload = {"people": [{"stats": [{"splits": [
+        {"team": {"id": 147, "name": "New York Yankees"}, "stat": {"strikeOuts": 41}},
+    ]}]}]}
+    check("team_from_splits: reads the team off a split entry",
+          normalizer.team_from_splits(split_payload) == "New York Yankees")
+    # On vsTeam the entry carries both; the opponent is a different team and
+    # must not be mistaken for the player's own.
+    vs_payload = {"people": [{"stats": [{"splits": [
+        {"team": {"name": "New York Yankees"}, "opponent": {"name": "Los Angeles Dodgers"},
+         "stat": {"homeRuns": 2}},
+    ]}]}]}
+    check("team_from_splits: returns the player's team, not the opponent",
+          normalizer.team_from_splits(vs_payload) == "New York Yankees")
+    # The grand-total split names no team, so the first entry that does wins.
+    totals_first = {"people": [{"stats": [{"splits": [
+        {"sport": {"id": 0}, "stat": {"homeRuns": 12}},
+        {"team": {"name": "Detroit Tigers"}, "stat": {"homeRuns": 12}},
+    ]}]}]}
+    check("team_from_splits: skips the teamless grand total",
+          normalizer.team_from_splits(totals_first) == "Detroit Tigers")
+    check("team_from_splits: empty payload -> None", normalizer.team_from_splits({}) is None)
+    check("team_from_splits: splits without a team -> None",
+          normalizer.team_from_splits({"people": [{"stats": [{"splits": [{"stat": {}}]}]}]}) is None)
+
     # normalize_total_stat picks the grand total, never sums the duplicate splits.
     # With no "All" split (sport id 0), it falls back to the most-games split.
     no_all = {"people": [{"stats": [{"splits": [
@@ -537,6 +565,20 @@ def filter_checks() -> None:
             "date_range last_30_days: window meta embedded (days == 30, year matches start_date)",
             l30.get("scope") == "last_30_days" and l30.get("days") == 30 and l30.get("year") == int(l30["start_date"][:4]),
         )
+
+    # Every filtered path reports the player's team, the same as the season line.
+    # Anchored on 2024, when Judge was a Yankee, so the fact cannot drift. Runs
+    # against the real tool because the point is the tools.py -> grounding.py
+    # contract: a team the answer states has to be retrieved data, not recall.
+    season_line = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024)
+    check("team: season line reports the team (unchanged)", season_line.get("team") == "New York Yankees")
+    check("team: date_range path reports the team", sa.get("team") == "New York Yankees")
+    check("team: custom window reports the team", custom.get("team") == "New York Yankees")
+    vs_dodgers = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, opponent="Dodgers")
+    check("team: opponent path reports Judge's team, not the opponent",
+          vs_dodgers.get("team") == "New York Yankees" and vs_dodgers.get("opponent") == "Los Angeles Dodgers")
+    vs_left = tools.get_player_stat("Aaron Judge", "homeRuns", season=2024, split="vs_left")
+    check("team: split path reports the team", vs_left.get("team") == "New York Yankees")
 
     # A custom window needs both ends. Supplying one alone used to skip the range
     # branch entirely and return the full-season line, answering a different

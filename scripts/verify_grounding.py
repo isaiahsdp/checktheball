@@ -210,36 +210,135 @@ def date_range_year_claim() -> None:
     check("date-range+year claim: year unverifiable when result omits it", c["supported"] is False and c["missing"] == ["2024"])
 
 
-def derived_rate_claim() -> None:
-    # A rate the model computes itself: 18 strikeouts over 2 games -> 9.0 per
-    # game. 9.0 was never returned by a tool, but both inputs are grounded, so
-    # the ratio fallback supports it (mirrors fantasy.py's derived stats, but
-    # verified after the fact instead of computed ahead of time).
-    tool_results = [{"name": "get_player_stat", "input": {}, "result": {
-        "player": "Tarik Skubal", "strikeOuts": 18, "gamesPlayed": 2}}]
-    ok = ground_answer("…", tool_results, client=FakeExtractor(
-        [{"text": "That is 9.0 strikeouts per game", "values": ["9.0"]}]))
-    c = ok["claims"][0]
-    check("derived rate: 18/2 = 9.0 grounds via a computed ratio", c["supported"] is True)
-    check("derived rate: ratio match flagged in `derived`, not silent", c.get("derived") == ["9.0"])
 
-    # Contrast (false-positive guard): a derived-looking number that is not any
-    # real ratio of the corpus stays unsupported.
-    bad = ground_answer("…", tool_results, client=FakeExtractor(
-        [{"text": "That is 7.5 strikeouts per game", "values": ["7.5"]}]))
-    check("derived rate: 7.5 is no ratio of 18 and 2, still flagged unsupported", bad["supported_claims"] == 0)
 
-    # A directly-present number must not be mislabeled as derived.
-    direct = ground_answer("…", tool_results, client=FakeExtractor(
-        [{"text": "He had 18 strikeouts", "values": ["18"]}]))
-    check("derived rate: a direct match is not tagged derived", "derived" not in direct["claims"][0])
+def iso_date_is_context() -> None:
+    # A refusal that cites today's date ("not playing in today's games
+    # (2026-08-03)") scored 0.00 in production: the extractor put the date in
+    # values despite being told not to, and the tool had returned only an error
+    # string, so nothing matched. A date names when a stat was measured, so it
+    # is context. Handled here as well as in the prompt because an ISO date is
+    # recognizable by shape alone, with no sport vocabulary involved.
+    errored = [{"name": "get_fantasy_points", "input": {"player": "Jung Hoo Lee"},
+                "result": {"error": "No player matching 'Jung Hoo Lee' found in today's games."}}]
+    g = ground_answer("…", errored, client=FakeExtractor(
+        [{"text": "Jung Hoo Lee is not in today's games (2026-08-03)",
+          "values": ["Jung Hoo Lee", "2026-08-03"]}]))
+    check("iso date: a date in values does not sink an otherwise sound claim",
+          g["claims"][0]["missing"] == [])
+
+    # A bare year is a real fact the answer asserts, so it still has to ground.
+    # Guards against widening this into "anything date-ish passes".
+    year_only = [{"name": "get_player_stat", "input": {}, "result": {"value": 58, "season": 2024}}]
+    right = ground_answer("…", year_only, client=FakeExtractor(
+        [{"text": "in 2024 he hit 58", "values": ["2024", "58"]}]))
+    check("iso date: a bare year is still checked", right["supported_claims"] == 1)
+    wrong = ground_answer("…", year_only, client=FakeExtractor(
+        [{"text": "in 1999 he hit 58", "values": ["1999", "58"]}]))
+    check("iso date: a wrong year still fails", wrong["claims"][0]["missing"] == ["1999"])
+
+    # Only a full ISO date passes. A number that merely contains digits and
+    # dashes is not waved through.
+    partial = ground_answer("…", year_only, client=FakeExtractor(
+        [{"text": "over 2024-06", "values": ["2024-06"]}]))
+    check("iso date: a partial date is not treated as one", partial["supported_claims"] == 0)
+
+
+def model_arithmetic_does_not_ground() -> None:
+    # The load-bearing rule after the derived-ratio fallback was removed: a
+    # number the model works out itself is not verified data, no matter how
+    # cleanly it follows from numbers we did retrieve. 41/222 is a correct
+    # strikeout rate and still must not ground on its own. Re-adding an
+    # after-the-fact arithmetic check would flip these, which is the point of
+    # guarding them: on a leaderboard-sized result that check accepted roughly
+    # half of all percentages, so it approved invented numbers as readily as
+    # real ones. The supported path is core/compute.py.
+    lookup = [{"name": "get_player_stat", "input": {}, "result": {
+        "player": "Trent Grisham", "strikeOuts": 41, "atBats": 222}}]
+    for label, value in (("the decimal ratio", "0.1847"), ("the percentage", "18.47%"),
+                         ("the rounded percentage", "18%")):
+        g = ground_answer("…", lookup, client=FakeExtractor(
+            [{"text": f"a strikeout rate of {value}", "values": [value]}]))
+        check(f"model math: {label} does not ground without a compute result",
+              g["supported_claims"] == 0)
+
+    # Subtraction likewise: 24 - 17 = 7 is correct and still unverified.
+    pair = [{"name": "get_player_stat", "input": {}, "result": {"a": 24, "b": 17}}]
+    gap = ground_answer("…", pair, client=FakeExtractor(
+        [{"text": "a gap of 7 home runs", "values": ["7"]}]))
+    check("model math: a difference the model subtracted does not ground",
+          gap["supported_claims"] == 0)
+
+
+def computed_value_grounds_directly() -> None:
+    # The compute tool is what makes the rate above verifiable: the same claim
+    # grounds once the number arrives as a tool result instead of out of the
+    # model's head. Paired with model_arithmetic_does_not_ground, this is the
+    # whole design in two checks.
+    from core.compute import run_compute
+
+    lookup = [{"name": "get_player_stat", "input": {}, "result": {
+        "player": "Trent Grisham", "split": "vs_right", "strikeOuts": 41, "atBats": 222}}]
+    computed = run_compute({"operation": "divide", "operands": [41, 222]}, lookup)
+    tool_results = lookup + [{"name": "compute", "input": {}, "result": computed}]
+
+    claim = [{"text": "Trent Grisham struck out in 18.47% of his at-bats against righties",
+              "values": ["Trent Grisham", "18.47%"]}]
+    g = ground_answer("…", tool_results, client=FakeExtractor(claim))
+    check("computed value: the same rate grounds once compute returned it",
+          g["claims"][0]["supported"] is True)
+
+    # The whole-percent form the model usually reaches for comes back too, so
+    # "about 18%" grounds without any rounding slack in the verifier.
+    whole = ground_answer("…", tool_results, client=FakeExtractor(
+        [{"text": "That is about an 18% strikeout rate", "values": ["18%"]}]))
+    check("computed value: the whole-percent form grounds too", whole["supported_claims"] == 1)
+
+    # A number compute never returned still fails, even next to a compute result.
+    invented = ground_answer("…", tool_results, client=FakeExtractor(
+        [{"text": "That is a 26% strikeout rate", "values": ["26%"]}]))
+    check("computed value: a rate compute did not return stays unsupported",
+          invented["supported_claims"] == 0)
+
+
+def split_label_is_not_a_value() -> None:
+    # A live 0.00: the answer said "44.74% vs. RHP", the math was right, and the
+    # claim failed because "RHP" is uppercase and so was checked as a proper
+    # noun against data that says "vs_right". A handedness or home/away label
+    # names the slice a number came from, exactly like a date, so the extraction
+    # prompt excludes it rather than the verifier special-casing abbreviations
+    # (which would be baseball vocabulary in a sport-agnostic module).
+    from core.grounding import _EXTRACTION_SYSTEM
+
+    check("split label: the extractor is told to skip handedness labels",
+          "RHP" in _EXTRACTION_SYSTEM and "LHP" in _EXTRACTION_SYSTEM)
+    check("split label: and home/away labels",
+          "at home" in _EXTRACTION_SYSTEM and "on the road" in _EXTRACTION_SYSTEM)
+    check("split label: an opponent's team name is still a value",
+          "opponent's team name IS a value" in _EXTRACTION_SYSTEM)
+
+    # If one slips through anyway, an uppercase label still fails, which is why
+    # the rule lives in the prompt. Documents the residual gap, in the style of
+    # value_only_in_input.
+    tool_results = [{"name": "get_player_stat", "input": {},
+                     "result": {"player": "Spencer Jones", "split": "vs_right", "strikeOuts": 34}}]
+    leaked = ground_answer("…", tool_results, client=FakeExtractor(
+        [{"text": "34 strikeouts vs. RHP", "values": ["34", "RHP"]}]))
+    check("split label: an abbreviation that slips through still fails (known gap)",
+          leaked["claims"][0]["missing"] == ["RHP"])
+    # Spelled out in lowercase it passes as a descriptive label, which is why
+    # only the abbreviated answers failed in production.
+    spelled = ground_answer("…", tool_results, client=FakeExtractor(
+        [{"text": "34 strikeouts", "values": ["34", "right-handed pitching"]}]))
+    check("split label: the lowercase spelled-out form was never affected",
+          spelled["supported_claims"] == 1)
 
 
 def leaderboard_gap_claim() -> None:
     # A leaderboard answer states the gap behind the leader ("trailed by 14").
-    # get_top_performers now precomputes gap_from_leader, so the number grounds
-    # via the normal direct-match path, not grounding's division fallback. This
-    # is the fix landing at the source (tools.py), with no grounding.py change.
+    # get_top_performers precomputes gap_from_leader, so the number is retrieved
+    # data rather than model subtraction. Same fix as compute, landed at the
+    # source: with nothing precomputed, this claim would not ground at all.
     tool_results = [{"name": "get_top_performers", "input": {}, "result": {
         "scope": "season", "stat": "strikeOuts", "season": 2024, "leaders": [
             {"player": "Garrett Crochet", "value": 255, "gap_from_leader": 0},
@@ -247,35 +346,16 @@ def leaderboard_gap_claim() -> None:
         ]}}]
     claim = [{"text": "Skubal trailed the strikeout leader by 14", "values": ["Tarik Skubal", "14"]}]
     g = ground_answer("…", tool_results, client=FakeExtractor(claim))
-    c = g["claims"][0]
-    check("leaderboard gap: 'trailed by 14' grounds via precomputed gap_from_leader", c["supported"] is True)
-    check("leaderboard gap: 14 matched directly, not via the derived-ratio fallback", "derived" not in c)
+    check("leaderboard gap: 'trailed by 14' grounds via precomputed gap_from_leader",
+          g["claims"][0]["supported"] is True)
 
-
-def derived_ratio_widens_with_corpus_size() -> None:
-    # Documents a known limitation, in the style of value_only_in_input. The
-    # ratio fallback tries every ordered pair, so the set of numbers it accepts
-    # grows with the square of the retrieved data. Against a two-number result,
-    # 22 is correctly rejected; against an ordinary five-row leaderboard it
-    # grounds as a coincidental ratio (44 / 2) despite no tool returning it.
-    # This is why a predictable derived value belongs in the tool output
-    # (gap_from_leader) rather than in a wider arithmetic fallback.
-    small = [{"name": "get_player_stat", "input": {}, "result": {"value": 44, "gamesPlayed": 2}}]
-    tight = ground_answer("…", small, client=FakeExtractor([{"text": "he hit 22", "values": ["22"]}]))
-    check("derived ratio: 22 grounds against a corpus that really contains 44 and 2", tight["supported_claims"] == 1)
-
-    leaderboard = [{"name": "get_top_performers", "input": {"stat": "homeRuns", "season": 2024, "limit": 5}, "result": {
-        "scope": "season", "stat": "homeRuns", "season": 2024, "limit": 5, "leaders": [
-            {"rank": 1, "player": "A", "value": 58, "gap_from_leader": 0},
-            {"rank": 2, "player": "B", "value": 54, "gap_from_leader": 4},
-            {"rank": 3, "player": "C", "value": 48, "gap_from_leader": 10},
-            {"rank": 4, "player": "D", "value": 47, "gap_from_leader": 11},
-            {"rank": 5, "player": "E", "value": 44, "gap_from_leader": 14},
-        ]}}]
-    wide = ground_answer("…", leaderboard, client=FakeExtractor([{"text": "he hit 22", "values": ["22"]}]))
-    c = wide["claims"][0]
-    check("derived ratio: a leaderboard-sized corpus accepts 22 as a coincidental ratio", c["supported"] is True)
-    check("derived ratio: the coincidental match is tagged derived, so it stays traceable", c.get("derived") == ["22"])
+    # Contrast: strip the precomputed field and the same gap is model math again.
+    bare = [{"name": "get_top_performers", "input": {}, "result": {
+        "leaders": [{"player": "Garrett Crochet", "value": 255},
+                    {"player": "Tarik Skubal", "value": 241}]}}]
+    without = ground_answer("…", bare, client=FakeExtractor(claim))
+    check("leaderboard gap: without the precomputed field the gap does not ground",
+          without["supported_claims"] == 0)
 
 
 def main() -> int:
@@ -290,9 +370,11 @@ def main() -> int:
     negative_number()
     error_message_grounding()
     date_range_year_claim()
-    derived_rate_claim()
+    iso_date_is_context()
+    model_arithmetic_does_not_ground()
+    computed_value_grounds_directly()
+    split_label_is_not_a_value()
     leaderboard_gap_claim()
-    derived_ratio_widens_with_corpus_size()
     print(f"\n{_passed} passed, {_failed} failed")
     return 1 if _failed else 0
 
