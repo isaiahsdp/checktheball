@@ -146,31 +146,36 @@ def _date_range_stats(
     start_date: str | None,
     end_date: str | None,
     season: int,
-) -> tuple[dict[str, Any], str, dict[str, Any]] | None:
+) -> tuple[dict[str, Any], str, dict[str, Any], str | None] | None:
     """Fetch a player's stats over a preset or custom range, MLB-aggregated.
 
-    Returns (stats, scope_label, window_meta), or None for an unknown preset.
-    ``window_meta`` documents the queried window and, crucially, exposes its
-    numbers (span size and year) so an answer that cites "last 10 games",
+    Returns (stats, scope_label, window_meta, team), or None for an unknown
+    preset. ``window_meta`` documents the queried window and, crucially, exposes
+    its numbers (span size and year) so an answer that cites "last 10 games",
     "30 days", or the year of a date range ("...in 2024") stays grounded. The
     year is a real, queried fact; without it as a number the deterministic check
-    can't verify a year the model correctly states.
+    can't verify a year the model correctly states. ``team`` is there for the
+    same reason: the payload names it, so a stated team is retrieved data
+    instead of something the model recalled.
     """
+    def totals(raw: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+        return normalizer.normalize_total_stat(raw), normalizer.team_from_splits(raw)
+
     if start_date and end_date:
-        raw = client.get_player_stats_by_date_range(player_id, start_date, end_date, group, season=int(start_date[:4]))
-        return normalizer.normalize_total_stat(raw), "date_range", {"start_date": start_date, "end_date": end_date, "year": int(start_date[:4])}
+        stats, team = totals(client.get_player_stats_by_date_range(player_id, start_date, end_date, group, season=int(start_date[:4])))
+        return stats, "date_range", {"start_date": start_date, "end_date": end_date, "year": int(start_date[:4])}, team
     if date_range == "last_10_games":
-        raw = client.get_player_last_x_games(player_id, 10, group, season=season)
-        return normalizer.normalize_total_stat(raw), "last_10_games", {"games": 10, "year": season}
+        stats, team = totals(client.get_player_last_x_games(player_id, 10, group, season=season))
+        return stats, "last_10_games", {"games": 10, "year": season}, team
     if date_range == "last_30_days":
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        raw = client.get_player_stats_by_date_range(player_id, start, end, group, season=datetime.now().year)
-        return normalizer.normalize_total_stat(raw), "last_30_days", {"days": 30, "start_date": start, "end_date": end, "year": int(start[:4])}
+        stats, team = totals(client.get_player_stats_by_date_range(player_id, start, end, group, season=datetime.now().year))
+        return stats, "last_30_days", {"days": 30, "start_date": start, "end_date": end, "year": int(start[:4])}, team
     if date_range == "since_allstar":
         start, end = _second_half_range(season)
-        raw = client.get_player_stats_by_date_range(player_id, start, end, group, season=season)
-        return normalizer.normalize_total_stat(raw), "since_allstar", {"start_date": start, "end_date": end, "year": season}
+        stats, team = totals(client.get_player_stats_by_date_range(player_id, start, end, group, season=season))
+        return stats, "since_allstar", {"start_date": start, "end_date": end, "year": season}, team
     return None
 
 
@@ -215,9 +220,8 @@ def get_player_stat(
         if matched_team is None:
             return {"error": f"No team found matching '{opponent}'."}
         team_id, team_name = matched_team
-        stats = normalizer.normalize_total_stat(
-            client.get_player_vs_team(player_id, team_id, season, group)
-        )
+        raw = client.get_player_vs_team(player_id, team_id, season, group)
+        stats, team = normalizer.normalize_total_stat(raw), normalizer.team_from_splits(raw)
         scope, extra = "vs_team", {"opponent": team_name}
         if not stats:
             where = f" in {season}" if season else ""
@@ -229,7 +233,7 @@ def get_player_stat(
                 "error": f"Unknown date_range '{date_range}'.",
                 "available_ranges": ["last_10_games", "last_30_days", "since_allstar"],
             }
-        stats, scope, window = ranged
+        stats, scope, window, team = ranged
         extra = {"range": date_range or "custom", **window}
         if not stats:
             return {"error": f"No data for {full_name} over {date_range or 'that window'}."}
@@ -239,13 +243,14 @@ def get_player_stat(
             return {"error": f"Unknown split '{split}'.", "available_splits": sorted(_SPLIT_CODES)}
         if season is None:
             season = _current_season()
+        raw = _cached_player_splits(player_id, code, season, group)
         matched = next(
-            (s for s in normalizer.normalize_splits(_cached_player_splits(player_id, code, season, group), group=group) if s["code"] == code),
+            (s for s in normalizer.normalize_splits(raw, group=group) if s["code"] == code),
             None,
         )
         if matched is None:
             return {"error": f"No '{split}' split data for {full_name} in {season}."}
-        stats, scope = matched["stats"], "season"
+        stats, scope, team = matched["stats"], "season", normalizer.team_from_splits(raw)
         extra = {"split": split, "split_description": matched["description"]}
     else:
         if season is not None:

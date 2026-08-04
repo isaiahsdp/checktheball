@@ -336,6 +336,29 @@ def normalize_total_stat(raw: dict[str, Any]) -> dict[str, Any]:
     return total.get("stat", {})
 
 
+def team_from_splits(raw: dict[str, Any]) -> str | None:
+    """The player's own team from any split-bearing person payload.
+
+    byDateRange, lastXGames, vsTeam and the split-hydrated payloads all carry
+    the player's team on each split entry, so a filtered lookup can report it
+    the way a season line already does. On vsTeam the entry also carries
+    `opponent`, a different team; this deliberately reads only `team`.
+
+    The grand-total split (sport id 0) names no team, hence taking the first
+    entry that does. A player traded mid-window has an entry per team and this
+    returns whichever the API lists first, so the other one will not ground.
+    """
+    people = raw.get("people", [])
+    if not people:
+        return None
+    for stat_group in people[0].get("stats", []):
+        for entry in stat_group.get("splits", []):
+            name = (entry.get("team") or {}).get("name")
+            if name:
+                return name
+    return None
+
+
 def normalize_splits(
     raw: dict[str, Any], group: str | None = None
 ) -> list[dict[str, Any]]:
