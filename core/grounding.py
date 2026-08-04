@@ -22,6 +22,7 @@ MAX_TOKENS = 1024
 # Numbers pulled from different sources ("58", 58, ".322") compare as floats.
 _NUM_TOL = 1e-4
 _NUMBER_RE = re.compile(r"-?\d+\.?\d*|-?\.\d+")
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 _EXTRACTION_SYSTEM = """\
 You are a fact-checking assistant. Read the answer and list its verifiable
@@ -37,6 +38,11 @@ name of the stat category itself (e.g. "home runs", "batting average", "OPS",
 Do NOT include calendar dates or date ranges (e.g. "June 30, 2025", "July 19 to
 Sept 30", "since the All-Star break") as values. They describe the time window a
 stat was measured over, not the stat itself.
+
+Do NOT include the split or condition a stat was measured under (e.g. "RHP",
+"LHP", "vs right-handed pitching", "at home", "on the road"). Like dates, these
+name which slice of the data a number came from, not the number itself. An
+opponent's team name IS a value and should be included.
 
 Skip subjective or evaluative statements ("a historic season", "MVP-caliber")
 and skip meta statements about your own ability ("I can't answer that", "my
@@ -148,6 +154,14 @@ def matches_retrieved(value: float, numbers: set[float]) -> bool:
 
 def _value_supported(value: str, numbers: set[float], corpus: str) -> bool:
     """Whether a claimed value is backed by the data retrieved this turn."""
+    # A calendar date says when a stat was measured, not what it is, so it is
+    # context in the same way a lowercase label is. The extractor is already
+    # told to leave dates out of values; this catches the ones that slip
+    # through, which a refusal citing today's date reliably did. Matched in
+    # full and only in ISO form, so a bare year stays a checkable fact and no
+    # stat can be mistaken for a date.
+    if _ISO_DATE_RE.fullmatch(value.strip()):
+        return True
     nums = _numbers_in(value)
     if nums:
         # Every number must have been retrieved. Arithmetic the model works out
