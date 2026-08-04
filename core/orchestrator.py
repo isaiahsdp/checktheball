@@ -19,6 +19,8 @@ from typing import Any, Protocol
 import anthropic
 from dotenv import load_dotenv
 
+from core.compute import COMPUTE_SCHEMA, TOOL_NAME as COMPUTE_TOOL, run_compute
+
 # Sonnet 5 handles the reasoning and tool selection.
 MODEL = "claude-sonnet-5"
 MAX_TOKENS = 4096
@@ -39,11 +41,13 @@ Rules:
 - Never state a statistic, score, or factual claim from your own memory. Every \
 number in your answer must come from a tool result in this conversation.
 - A number you calculate yourself (a sum, difference, percentage, per-game rate, \
-or projection over extra games) is not verified data. Prefer a tool that computes \
-it. If you must mention one, show the grounded tool numbers it comes from, and \
-never present a multi-step estimate or projection as a precise figure. If the \
-number the question centers on cannot come from a tool, say so plainly instead \
-of computing it yourself.
+or projection over extra games) is not verified data. Use the 'compute' tool to \
+do the arithmetic instead: it works only on numbers other tools already returned \
+this turn, and what it gives back is verified data you can state directly. State \
+a computed value exactly as compute returned it; do not round it further. Never \
+present a multi-step estimate or projection as a precise figure. If the number \
+the question centers on cannot come from a tool, say so plainly instead of \
+computing it yourself.
 - Call the appropriate tool(s) to get the data you need. For compound questions, \
 call multiple tools and combine their results.
 - Do not assume that data for the current or a recent season doesn't exist yet. \
@@ -127,7 +131,9 @@ def answer_question(
             "model": model,
             "max_tokens": MAX_TOKENS,
             "system": system_blocks,
-            "tools": tools.TOOL_SCHEMAS,
+            # compute rides alongside the sport's tools: it is sport-agnostic and
+            # needs this turn's results, which the provider never sees.
+            "tools": [*tools.TOOL_SCHEMAS, COMPUTE_SCHEMA],
             "messages": messages,
         }
         if force_answer:
@@ -146,7 +152,13 @@ def answer_question(
                 continue
             tool_calls_made.append({"name": block.name, "input": block.input})
             try:
-                result = tools.call_tool(block.name, block.input)
+                if block.name == COMPUTE_TOOL:
+                    # Validated against what has been retrieved so far, so a
+                    # compute call in an earlier round than its inputs errors out
+                    # rather than laundering an invented number.
+                    result = run_compute(block.input, tool_results)
+                else:
+                    result = tools.call_tool(block.name, block.input)
                 is_error = isinstance(result, dict) and "error" in result
             except Exception as exc:  # bad args, etc.; feed back, don't crash
                 result = {"error": f"Tool execution failed: {exc}"}

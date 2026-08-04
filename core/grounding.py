@@ -130,74 +130,54 @@ def _index_tool_results(tool_results: list[dict[str, Any]]) -> tuple[set[float],
     return numbers, _normalize(" ".join(text_parts))
 
 
-def _is_derived_ratio(target: float, numbers: set[float]) -> bool:
-    # Fallback for a rate the model computes itself (K/9, per-game averages): a
-    # number no tool returned, but that equals one grounded number divided by
-    # another. Division only; other operations ground far more spurious pairs and
-    # aren't the demonstrated case. The tight _NUM_TOL keeps coincidental ratios
-    # from matching, and number sets per turn are small, so all-pairs is cheap.
-    nums = list(numbers)
-    for i in range(len(nums)):
-        for j in range(len(nums)):
-            if i == j:  # a/a is always 1.0, not a meaningful derivation
-                continue
-            denom = nums[j]
-            if abs(denom) <= _NUM_TOL:  # never divide by (near) zero
-                continue
-            if abs(target - nums[i] / denom) <= _NUM_TOL:
-                return True
-    return False
+def retrieved_numbers(tool_results: list[dict[str, Any]]) -> set[float]:
+    """Every number the tools returned this turn.
+
+    Shared with ``core.compute`` so a validated operand and a grounded value mean
+    the same thing. If the two ever indexed numbers differently, a computed
+    result could pass validation and then fail verification.
+    """
+    numbers, _ = _index_tool_results(tool_results)
+    return numbers
 
 
-def _number_grounded(target: float, numbers: set[float]) -> str | None:
-    """How a claimed number is backed: "direct", "derived_ratio", or None."""
-    if any(abs(target - dn) <= _NUM_TOL for dn in numbers):
-        return "direct"
-    if _is_derived_ratio(target, numbers):
-        return "derived_ratio"
-    return None
+def matches_retrieved(value: float, numbers: set[float]) -> bool:
+    """Whether ``value`` is one of the numbers retrieved this turn."""
+    return any(abs(value - n) <= _NUM_TOL for n in numbers)
 
 
-def _value_supported(value: str, numbers: set[float], corpus: str) -> tuple[bool, str | None]:
-    """(supported, matched_via); matched_via is set only for numeric values."""
+def _value_supported(value: str, numbers: set[float], corpus: str) -> bool:
+    """Whether a claimed value is backed by the data retrieved this turn."""
     nums = _numbers_in(value)
     if nums:
-        # A value with numbers is backed only if every number grounds, directly
-        # or as a simple ratio of two grounded numbers (a rate the model derived).
-        kinds = [_number_grounded(n, numbers) for n in nums]
-        if any(k is None for k in kinds):
-            return False, None
-        return True, ("derived_ratio" if "derived_ratio" in kinds else "direct")
+        # Every number must have been retrieved. Arithmetic the model works out
+        # in its head is deliberately not accepted here: it goes through the
+        # compute tool, which validates its operands and puts the result in the
+        # tool output, where it grounds by direct match like any other lookup.
+        # An after-the-fact check ("does this equal some ratio of two numbers we
+        # happen to hold?") accepts too much: on a leaderboard-sized result it
+        # matched roughly half of all percentages. See core/compute.py.
+        return all(matches_retrieved(n, numbers) for n in nums)
     # Lowercase descriptive phrases ("road games", "home runs") are labels, not
     # checkable data points, so they don't count against a claim.
     if value.strip() == value.strip().lower():
-        return True, None
+        return True
     # A proper-noun value (player, team, award) must appear in the data.
     normalized = _normalize(value)
-    return (bool(normalized) and normalized in corpus), None
+    return bool(normalized) and normalized in corpus
 
 
 def _verify_claim(
     claim: dict[str, Any], numbers: set[float], corpus: str
 ) -> dict[str, Any]:
     values = claim.get("values", [])
-    missing = []
-    derived = []  # values grounded via a computed ratio, not a direct data match
-    for v in values:
-        supported, via = _value_supported(v, numbers, corpus)
-        if not supported:
-            missing.append(v)
-        elif via == "derived_ratio":
-            derived.append(v)
-    result = {
+    missing = [v for v in values if not _value_supported(v, numbers, corpus)]
+    return {
         "text": claim.get("text", ""),
         "values": values,
-        "supported": len(missing) == 0,
+        "supported": not missing,
         "missing": missing,
     }
-    if derived:  # surface ratio-grounded values so a false positive stays traceable
-        result["derived"] = derived
-    return result
 
 
 def ground_answer(
