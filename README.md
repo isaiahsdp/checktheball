@@ -17,6 +17,7 @@ a model that can handle the flexible part of the question, with every number
 it states checked against real data before it's shown.
 
 ## Demo
+![CheckTheBall demo](CTB_demo.gif)
 
 ## Approach
 
