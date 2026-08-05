@@ -17,8 +17,11 @@ a model that can handle the flexible part of the question, with every number
 it states checked against real data before it's shown.
 
 ## Demo
-![CheckTheBall demo](CTB_demo.gif)
-
+<p align="center">
+  <img src="/assets/CTB_demo_1.png" width="32%">
+  <img src="/assets/CTB_demo_2.png" width="32%">
+  <img src="/assets/CTB_demo_3.png" width="32%">
+</p>
 ## Approach
 
 The model picks which data to look up, but never supplies the numbers
