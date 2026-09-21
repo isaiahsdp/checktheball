@@ -34,8 +34,8 @@ tests trustworthy.
 | `scripts/verify_orchestrator.py` | 56 | none | the tool-use loop |
 | `scripts/verify_grounding.py` | 37 | none | the deterministic grounding check |
 | `scripts/verify_api.py` | 54 | none | the FastAPI endpoints |
-| `scripts/verify_mlb_data.py` | 156 | live (anchored) | the MLB data layer, tools, filters, cache |
-| `scripts/run_eval.py` | 40 questions | live (models) | full-pipeline benchmark |
+| `scripts/verify_mlb_data.py` | 163 | live (anchored) | the MLB data layer, tools, filters, cache |
+| `scripts/run_eval.py` | 100 questions | live (models) | full-pipeline benchmark |
 
 ### verify_orchestrator.py (56, offline)
 
@@ -116,7 +116,7 @@ A request with no `date` must cache under the real date, so the row written by
 midnight is still inside its freshness window after the rollover and serves the
 previous day's slate.
 
-### verify_mlb_data.py (156, mixed)
+### verify_mlb_data.py (163, mixed)
 
 A few `live_feature_checks` are conditional on there being games today, so the
 runtime count can be several lower than the 167 `check()` calls in the file.
@@ -162,10 +162,29 @@ The main regression suite, in six groups:
 
 ## The eval and its two metrics
 
-`run_eval.py` runs the full pipeline over 40 questions across 16 categories and
+`run_eval.py` runs the full pipeline over 100 questions across 16 categories and
 reports two separate rates. It is a benchmark, not a pass/fail gate: scores vary
 between runs because claim extraction and tool selection are model calls. Each
 run appends a summary row to `docs/eval_history.md`.
+
+Every category has six questions, and four have seven: split, opponent, fantasy,
+and pitching, the shapes the production query log shows failing most. Six is the
+floor for a category mean to be readable. The set was 40 questions before, with
+some categories at one or two, where a single miss read as 0.50 or 0.00 and a
+weak category barely moved the overall score. Expanding it lowered the measured
+grounding rate because it made those weaknesses visible, not because the
+pipeline changed. The rows in `eval_history.md` before the expansion are not
+comparable with the rows after it.
+
+At six questions, one failed answer moves a category by up to 0.17. Repeated runs
+of the same set show the overall rate moving by about 0.001 while single
+categories swing by that full step, so a category change needs a second run
+before it counts as a regression. The overall rate is the one to trend.
+
+66 of the 100 questions are annotated for tool faithfulness. The other 34 have no
+single correct call (compound, opinion, live, date awareness, out of scope, and a
+few where declining is the right answer) and are left unannotated rather than
+forced.
 
 - Grounding rate answers: does the answer's content trace back to the data
   that was retrieved? (faithful to the data)
