@@ -31,8 +31,10 @@ here runs them against real MLB data and feeds the results back, and only then
 does the model write its answer.
 
 Every answer is then **grounded**: each factual claim in it is checked
-against the data that was actually retrieved, and the score ships with the
-answer, so nothing gets a pass just for sounding right.
+against the data that was actually retrieved. Anything the tools did not back,
+whether an invented number or a fact the model supplied from memory, is marked
+unsupported instead of removed, and the score ships with the answer, so nothing
+gets a pass just for sounding right.
 
 That check confirms an answer matches the data that came back, not that the
 right data was fetched in the first place, and an answer asserting nothing can
