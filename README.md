@@ -26,15 +26,18 @@ it states checked against real data before it's shown.
 ## Approach
 
 The model picks which data to look up, but never supplies the numbers
-itself. Two separate, automatic checks then run on its answer:
+itself. It gets a set of stat-lookup tools and chooses which to call; the code
+here runs them against real MLB data and feeds the results back, and only then
+does the model write its answer.
 
-1. **Grounding.** Every factual claim in the answer is checked against the
-   data that was actually retrieved. Nothing gets a pass just for sounding
-   right.
-2. **Tool faithfulness.** A check on whether the model looked up the right
-   thing in the first place, not just whether its answer is internally
-   consistent. This matters because a claim-free answer can pass grounding
-   perfectly even if no real lookup happened at all.
+Every answer is then **grounded**: each factual claim in it is checked
+against the data that was actually retrieved, and the score ships with the
+answer, so nothing gets a pass just for sounding right.
+
+That check confirms an answer matches the data that came back, not that the
+right data was fetched in the first place, and an answer asserting nothing can
+score perfectly even when no lookup happened. The eval measures that second
+property separately, as tool faithfulness (see [Testing](#testing)).
 
 The model is also told today's real date on every request, so questions like
 "this season" resolve correctly instead of guessing from training data.
@@ -129,8 +132,19 @@ Python, FastAPI, SQLite, MLB-StatsAPI, and the Anthropic API.
 ## Testing
 
 Four fast offline test suites run before every commit. A separate live
-benchmark runs real questions through the actual model and tracks results
+benchmark runs 100 real questions through the actual model and tracks results
 over time, since live model output varies run to run.
+
+The benchmark reports two rates. Grounding is the same check that runs on
+every request. Tool faithfulness asks a different question: did the model look
+up the right thing? Every question with one clearly correct tool call is
+labeled with it by hand, and the run compares that label against what the model
+actually called. Needing that label is why this rate lives in the benchmark
+instead of in a live request.
+
+Neither rate is a model grading a model. Grounding uses a small model to split
+an answer into claims, but what passes is a mechanical check against the
+retrieved data.
 
 ## Setup
 
